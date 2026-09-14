@@ -521,9 +521,9 @@ namespace AgGateway.ADAPT.StandardPlugin
                         {
                             if (dataColumn.ProductId != null && section.ProductIndexWorkingData != null)
                             {
-                                if (section.FactoredDefinitionsBySourceCodeByProduct.ContainsKey(dataColumn.ProductId))
+                                if (section.FactoredDefinitionsBySourceCodeByProduct.TryGetValue(dataColumn.ProductId, out var factoredDefinitionsForProduct) &&
+                                    factoredDefinitionsForProduct.TryGetValue(dataColumn.SrcName, out var factoredDefinition))
                                 {
-                                    var factoredDefinition = section.FactoredDefinitionsBySourceCodeByProduct[dataColumn.ProductId][dataColumn.SrcName];
                                     NumericRepresentationValue value = record.GetMeterValue(factoredDefinition.WorkingData) as NumericRepresentationValue;
                                     var doubleVal = value.AsConvertedDouble(dataColumn.TargetUOMCode) * factoredDefinition.Factor;
 
@@ -540,15 +540,22 @@ namespace AgGateway.ADAPT.StandardPlugin
                                 }
                                 else
                                 {
-                                    dataColumn.Values.Add(0d); //We've grouped operations together and this doesn't apply.
+                                    dataColumn.Values.Add(0d); //This section doesn't report this working data for this product (e.g. grouped operations, or not every section reports every column)
                                 }
                             }
                             else
                             {
-                                var factoredDefinition = section.FactoredDefinitionsBySourceCodeByProduct[string.Empty][dataColumn.SrcName];
-                                NumericRepresentationValue value = record.GetMeterValue(factoredDefinition.WorkingData) as NumericRepresentationValue;
-                                var doubleVal = value.AsConvertedDouble(dataColumn.TargetUOMCode) * factoredDefinition.Factor;
-                                dataColumn.Values.Add(doubleVal);
+                                if (section.FactoredDefinitionsBySourceCodeByProduct.TryGetValue(string.Empty, out var factoredDefinitionsForSection) &&
+                                    factoredDefinitionsForSection.TryGetValue(dataColumn.SrcName, out var factoredDefinition))
+                                {
+                                    NumericRepresentationValue value = record.GetMeterValue(factoredDefinition.WorkingData) as NumericRepresentationValue;
+                                    var doubleVal = value.AsConvertedDouble(dataColumn.TargetUOMCode) * factoredDefinition.Factor;
+                                    dataColumn.Values.Add(doubleVal);
+                                }
+                                else
+                                {
+                                    dataColumn.Values.Add(null); //This section doesn't report this working data; missing is not zero
+                                }
                             }
                         }
                     }
@@ -600,7 +607,7 @@ namespace AgGateway.ADAPT.StandardPlugin
         }
         internal string ProductKey()
         {
-            return string.Join(";", ProductIds.OrderBy(x => x).ToString());
+            return string.Join(";", ProductIds.OrderBy(x => x));
         }
 
         internal bool IsMatchingOperation(OperationDefinition other)

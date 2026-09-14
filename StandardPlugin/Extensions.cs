@@ -239,7 +239,7 @@ namespace AgGateway.ADAPT.StandardPlugin
         public static Polygon AsCoveragePolygon(this Point leadingPoint, double width, ref LeadingEdge latestLeadingEdge, double heading, double? reportedDistance, double? calculatedDistance)
         {
             LeadingEdge priorLeadingEdge = latestLeadingEdge;
-            latestLeadingEdge = new LeadingEdge(leadingPoint, width, priorLeadingEdge, heading, reportedDistance);
+            latestLeadingEdge = new LeadingEdge(leadingPoint, width, priorLeadingEdge, heading);
             Point backRight;
             Point backLeft;
             if (priorLeadingEdge != null)
@@ -251,15 +251,16 @@ namespace AgGateway.ADAPT.StandardPlugin
             {
                 //We only consider distance when we don't have a prior point to map from
                 double distance = 1; //1m as default without any other information (at start of data)
-                if (reportedDistance != null)
+                if (reportedDistance > 0d)
                 {
                     distance = reportedDistance.Value;
                 }
-                else if (calculatedDistance != null)
+                else if (calculatedDistance > 0d)
                 {
                     distance = calculatedDistance.Value;
                 }
-                distance = distance > 4 ? 4 : distance; //keep distances sane
+                //Clamp both ends: the floor keeps the back edge off the leading edge, which would make the polygon invalid
+                distance = Math.Clamp(distance, 0.1d, 4d);
 
                 backRight = latestLeadingEdge.Right.Destination(distance, HeadingBack(heading));
                 backLeft = backRight.Destination(width, HeadingLeft(heading));
