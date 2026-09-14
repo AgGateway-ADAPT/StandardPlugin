@@ -36,7 +36,7 @@
         "multiproduct": true
     },
     {
-        "source": "vrAppRateVolumnSetPoint",
+        "source": "vrAppRateVolumeSetPoint",
         "target": "AppliedVolumePerAreaTarget",
         "factor": false,
         "multiproduct": true
