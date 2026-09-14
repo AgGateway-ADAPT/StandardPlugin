@@ -172,10 +172,12 @@ namespace AgGateway.ADAPT.StandardPlugin
                 priorPoint = new Point(priorADAPTPoint.X, priorADAPTPoint.Y);
             }
 
+            var sectionDefinitions = FactoredDefinitionsBySourceCodeByProduct[string.Empty];
+
             double bearing = 0d;
-            if (FactoredDefinitionsBySourceCodeByProduct[string.Empty].ContainsKey("vrHeading"))
+            if (sectionDefinitions.TryGetValue("vrHeading", out var headingDefinition))
             {
-                var headingValue = ((NumericRepresentationValue)record.GetMeterValue(FactoredDefinitionsBySourceCodeByProduct[string.Empty]["vrHeading"].WorkingData))?.Value?.Value;
+                var headingValue = ((NumericRepresentationValue)record.GetMeterValue(headingDefinition.WorkingData))?.Value?.Value;
                 if (headingValue != null)
                 {
                     bearing = headingValue.Value;
@@ -194,13 +196,13 @@ namespace AgGateway.ADAPT.StandardPlugin
             var xy = x.Destination(Offset.Y ?? 0d, bearing + 90d % 360d);
 
             double? reportedDistance = null;
-            if (FactoredDefinitionsBySourceCodeByProduct[string.Empty].ContainsKey("vrDistanceTraveled") &&
-                record.GetMeterValue(FactoredDefinitionsBySourceCodeByProduct[string.Empty]["vrDistanceTraveled"].WorkingData) is NumericRepresentationValue distanceData)
+            if (sectionDefinitions.TryGetValue("vrDistanceTraveled", out var distanceDefinition) &&
+                record.GetMeterValue(distanceDefinition.WorkingData) is NumericRepresentationValue distanceData)
             {
                 reportedDistance = distanceData?.Value?.Value;
             }
-            double? calculatedDistance = null;  
-            if (reportedDistance == null && priorPoint != null)
+            double? calculatedDistance = null;
+            if (!(reportedDistance > 0d) && priorPoint != null)
             {
                 calculatedDistance = GeometryExporter.HaversineDistance(priorPoint, point);
             }
@@ -220,7 +222,7 @@ namespace AgGateway.ADAPT.StandardPlugin
 
     internal class LeadingEdge
     {
-        public LeadingEdge(Point leadingPoint, double width, LeadingEdge priorLeadingEdge, double heading, double? reportedDistance)
+        public LeadingEdge(Point leadingPoint, double width, LeadingEdge priorLeadingEdge, double heading)
         {
             Heading = heading;
             double wh = width / 2d;

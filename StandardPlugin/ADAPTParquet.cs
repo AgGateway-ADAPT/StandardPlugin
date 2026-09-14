@@ -14,7 +14,7 @@ namespace AgGateway.ADAPT.StandardPlugin
 {
     internal class ADAPTParquetWriter
     {
-        const int RowGroupSize = 65535;
+        const int RowGroupSize = 65536;
 
         public ADAPTParquetWriter(ADAPTParquetColumnData columnData)
         {    
