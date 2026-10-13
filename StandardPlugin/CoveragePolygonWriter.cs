@@ -24,7 +24,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             bounds = default;
 
             LeadingEdge priorLeadingEdge = latestLeadingEdge;
-            latestLeadingEdge = new LeadingEdge(geodesy, leadingCenter, width, in priorLeadingEdge, heading);
+            LeadingEdge candidateLeadingEdge = new LeadingEdge(geodesy, leadingCenter, width, in priorLeadingEdge, heading);
 
             LocalPoint backRightLocal;
             LocalPoint backLeftLocal;
@@ -46,7 +46,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                 }
 
                 distance = Math.Clamp(distance, 0.1d, 4d);
-                var rightLocal = geodesy.ToLocalPoint(latestLeadingEdge.RightLon, latestLeadingEdge.RightLat);
+                var rightLocal = geodesy.ToLocalPoint(candidateLeadingEdge.RightLon, candidateLeadingEdge.RightLat);
                 backRightLocal = geodesy.DestinationLocal(rightLocal, distance, Extensions.HeadingBack(heading));
                 backLeftLocal = geodesy.DestinationLocal(backRightLocal, width, Extensions.HeadingLeft(heading));
             }
@@ -54,34 +54,45 @@ namespace AgGateway.ADAPT.StandardPlugin
             geodesy.ToGeographic(backRightLocal.EastM, backRightLocal.NorthM, out double backRightLon, out double backRightLat);
             geodesy.ToGeographic(backLeftLocal.EastM, backLeftLocal.NorthM, out double backLeftLon, out double backLeftLat);
 
-            if (!CoverageWkb.IsValidQuad(
+            CoverageQuadStatus status = CoverageWkb.EvaluateQuad(
                 geodesy,
-                latestLeadingEdge.LeftLon,
-                latestLeadingEdge.LeftLat,
-                latestLeadingEdge.RightLon,
-                latestLeadingEdge.RightLat,
+                candidateLeadingEdge.LeftLon,
+                candidateLeadingEdge.LeftLat,
+                candidateLeadingEdge.RightLon,
+                candidateLeadingEdge.RightLat,
                 backRightLon,
                 backRightLat,
                 backLeftLon,
-                backLeftLat))
+                backLeftLat);
+            if (status == CoverageQuadStatus.SelfIntersection)
             {
+                latestLeadingEdge = default;
                 return false;
             }
 
+            if (status != CoverageQuadStatus.Valid)
+            {
+                // A stop or a collapsed ring keeps the previous leading edge so the next
+                // movement continues from it instead of starting a new short polygon.
+                latestLeadingEdge = priorLeadingEdge;
+                return false;
+            }
+
+            latestLeadingEdge = candidateLeadingEdge;
             wkb = CoverageWkb.WritePolygon(
-                latestLeadingEdge.LeftLon,
-                latestLeadingEdge.LeftLat,
-                latestLeadingEdge.RightLon,
-                latestLeadingEdge.RightLat,
+                candidateLeadingEdge.LeftLon,
+                candidateLeadingEdge.LeftLat,
+                candidateLeadingEdge.RightLon,
+                candidateLeadingEdge.RightLat,
                 backRightLon,
                 backRightLat,
                 backLeftLon,
                 backLeftLat);
             bounds = CoverageWkb.ComputeBounds(
-                latestLeadingEdge.LeftLon,
-                latestLeadingEdge.LeftLat,
-                latestLeadingEdge.RightLon,
-                latestLeadingEdge.RightLat,
+                candidateLeadingEdge.LeftLon,
+                candidateLeadingEdge.LeftLat,
+                candidateLeadingEdge.RightLon,
+                candidateLeadingEdge.RightLat,
                 backRightLon,
                 backRightLat,
                 backLeftLon,

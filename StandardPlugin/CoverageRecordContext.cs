@@ -31,7 +31,11 @@ namespace AgGateway.ADAPT.StandardPlugin
             out CoverageRecordContext context)
         {
             context = default;
-            var adaptPoint = (ApplicationDataModel.Shapes.Point)record.Geometry;
+            if (!(record.Geometry is ApplicationDataModel.Shapes.Point adaptPoint))
+            {
+                return false;
+            }
+
             double lon = adaptPoint.X;
             double lat = adaptPoint.Y;
             if (lon == 0d && lat == 0d)
@@ -41,9 +45,8 @@ namespace AgGateway.ADAPT.StandardPlugin
 
             double? priorLon = null;
             double? priorLat = null;
-            if (priorRecord != null)
+            if (priorRecord?.Geometry is ApplicationDataModel.Shapes.Point priorPoint)
             {
-                var priorPoint = (ApplicationDataModel.Shapes.Point)priorRecord.Geometry;
                 priorLon = priorPoint.X;
                 priorLat = priorPoint.Y;
             }
@@ -60,7 +63,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             return true;
         }
 
-        internal double ResolveBearing(SpatialRecord record, FactoredWorkingData headingDefinition)
+        internal double ResolveBearing(SpatialRecord record, FactoredWorkingData headingDefinition, double? previousHeading = null)
         {
             if (headingDefinition != null)
             {
@@ -69,18 +72,22 @@ namespace AgGateway.ADAPT.StandardPlugin
                 {
                     return headingValue.Value;
                 }
-
-                if (PriorLon.HasValue)
-                {
-                    return GeometryExporter.Bearing(PriorLon.Value, PriorLat.Value, Lon, Lat);
-                }
             }
-            else if (PriorLon.HasValue)
+
+            if (PriorLon.HasValue)
             {
+                // Identical positions have no direction. Bearing() of that pair is 0, which would
+                // swing a leading edge to north during a stop that did not report a heading.
+                if (previousHeading.HasValue &&
+                    GeometryExporter.Distance(PriorLon.Value, PriorLat.Value, Lon, Lat) == 0d)
+                {
+                    return previousHeading.Value;
+                }
+
                 return GeometryExporter.Bearing(PriorLon.Value, PriorLat.Value, Lon, Lat);
             }
 
-            return 0d;
+            return previousHeading ?? 0d;
         }
 
         internal double? ResolveReportedDistance(SpatialRecord record, FactoredWorkingData distanceDefinition)

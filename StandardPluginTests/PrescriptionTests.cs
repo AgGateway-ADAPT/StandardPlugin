@@ -276,6 +276,17 @@ namespace StandardPluginTests
                 using (var reader = new ParquetSharp.ParquetFileReader(parquetFile))
                 {
                     Assert.That(reader.FileMetaData.NumRows, Is.EqualTo(1));
+                    using (var document = JsonDocument.Parse(reader.FileMetaData.KeyValueMetadata["geo"]))
+                    {
+                        var geometryTypes = document.RootElement
+                            .GetProperty("columns")
+                            .GetProperty("geometry")
+                            .GetProperty("geometry_types")
+                            .EnumerateArray()
+                            .Select(item => item.GetString())
+                            .ToArray();
+                        Assert.That(geometryTypes, Is.EqualTo(new[] { "MultiPolygon" }));
+                    }
                 }
             }
 

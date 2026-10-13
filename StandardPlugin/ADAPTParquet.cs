@@ -20,6 +20,7 @@ namespace AgGateway.ADAPT.StandardPlugin
         private readonly bool _includeTimestamps;
         private readonly int _rowGroupSize;
         private readonly Func<string> _openFile;
+        private readonly string _geometryType;
         private readonly string[] _columnNames;
         private readonly List<DateTime> _timestamps;
         private readonly List<double?>[] _values;
@@ -35,7 +36,7 @@ namespace AgGateway.ADAPT.StandardPlugin
         private double _maxX;
         private double _maxY;
 
-        internal ADAPTParquetWriter(ADAPTParquetColumnData columnData, bool includeTimestamps, Func<string> openFile, int rowGroupSize = DefaultRowGroupSize)
+        internal ADAPTParquetWriter(ADAPTParquetColumnData columnData, bool includeTimestamps, Func<string> openFile, string geometryType = "Polygon", int rowGroupSize = DefaultRowGroupSize)
         {
             if (columnData == null)
             {
@@ -56,6 +57,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             _includeTimestamps = includeTimestamps;
             _rowGroupSize = rowGroupSize;
             _openFile = openFile;
+            _geometryType = string.IsNullOrEmpty(geometryType) ? "Polygon" : geometryType;
             _columnNames = columnData.Columns.Select(column => column.TargetName).ToArray();
             _timestamps = includeTimestamps ? new List<DateTime>(rowGroupSize) : null;
             _values = new List<double?>[_columnNames.Length];
@@ -264,7 +266,7 @@ namespace AgGateway.ADAPT.StandardPlugin
         {
             var geoColumn = new GeoParquet.GeoColumn();
             geoColumn.Encoding = "WKB";
-            geoColumn.Geometry_types.Add("Polygon");
+            geoColumn.Geometry_types.Add(_geometryType);
             geoColumn.Bbox = new[] { _minX, _minY, _maxX, _maxY };
             foreach (var entry in GeoParquet.GeoMetadata.GetGeoMetadata(geoColumn))
             {
@@ -486,7 +488,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             // unit uses it. A value in a different unit is converted from that unit, and that pair is cached too.
             if (srcUnitCode == SrcUOMCode)
             {
-                return ConvertValue(value.Value.Value);
+                return ConvertValue == null ? null : ConvertValue(value.Value.Value);
             }
 
             if (!value.Value.UnitOfMeasure.CanConvertInto(TargetUOMCode))

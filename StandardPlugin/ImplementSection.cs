@@ -194,6 +194,12 @@ namespace AgGateway.ADAPT.StandardPlugin
             _latestLeadingEdge = default;
         }
 
+        internal bool TryGetLeadingHeading(out double heading)
+        {
+            heading = _latestLeadingEdge.Heading;
+            return _latestLeadingEdge.HasValue;
+        }
+
     }
 
     internal struct LeadingEdge

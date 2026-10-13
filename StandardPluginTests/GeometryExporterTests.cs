@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.ApplicationDataModel.Common;
+using AgGateway.ADAPT.ApplicationDataModel.Documents;
 using AgGateway.ADAPT.ApplicationDataModel.LoggedData;
 using AgGateway.ADAPT.ApplicationDataModel.Representations;
 using AgGateway.ADAPT.StandardPlugin;
@@ -63,6 +64,71 @@ namespace StandardPluginTests
             Assert.That(5d.ConvertValue("m", "m"), Is.EqualTo(5d));
             Assert.That(1d.ConvertValue("seeds1ac-1", "seeds1ha-1"), Is.EqualTo(1d / 0.40468564224d).Within(1e-9));
             Assert.That(3d.ConvertValue("seeds1ac-1", "seeds1ha-1"), Is.EqualTo(3d / 0.40468564224d).Within(1e-9));
+        }
+
+        [Test]
+        public void UnknownUnitDoesNotPassTheValueThrough()
+        {
+            Assert.That(Extensions.BuildValueConverter("vrHeading", "not-a-unit", "m"), Is.Null);
+
+            var column = new ADAPTDataColumn(
+                new NumericWorkingData
+                {
+                    Representation = new NumericRepresentation { Code = "vrHeading" },
+                    UnitOfMeasure = new UnitOfMeasure { Code = "not-a-unit" }
+                },
+                "Heading",
+                "m");
+            column.InitializeConverter();
+            var meterValue = new NumericRepresentationValue
+            {
+                Representation = new NumericRepresentation { Code = "vrHeading" },
+                Value = new NumericValue(new UnitOfMeasure { Code = "not-a-unit" }, 5d)
+            };
+            Assert.That(column.ConvertMeterValue(meterValue), Is.Null);
+        }
+
+        [Test]
+        public void RemappedRepresentationWithAnUnknownUnitReturnsNull()
+        {
+            var downForce = new NumericRepresentationValue
+            {
+                Representation = new NumericRepresentation { Code = "vrDownForceApplied" },
+                Value = new NumericValue(new UnitOfMeasure { Code = "not-a-unit" }, 5d)
+            };
+            Assert.That(downForce.AsConvertedDouble("N"), Is.Null);
+            Assert.That(Extensions.BuildValueConverter("vrDownForceApplied", "not-a-unit", "N"), Is.Null);
+
+            var seedRate = new NumericRepresentationValue
+            {
+                Representation = new NumericRepresentation { Code = "vrSeedRateSeedsActual" },
+                Value = new NumericValue(new UnitOfMeasure { Code = "not-a-unit" }, 5d)
+            };
+            Assert.That(seedRate.AsConvertedDouble("count1ha-1"), Is.Null);
+            Assert.That(5d.ConvertValue("not-a-unit", "count1ha-1"), Is.Null);
+        }
+
+        [Test]
+        public void RepeatedConversionReusesTheCachedConverter()
+        {
+            Assert.That(1d.ConvertValue("m", "ft"), Is.Not.Null);
+            Assert.That(1d.ConvertValue("not-a-unit", "m"), Is.Null);
+            for (int i = 0; i < 1000; i++)
+            {
+                _ = 2d.ConvertValue("m", "ft");
+                _ = 2d.ConvertValue("not-a-unit", "m");
+            }
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 1000; i++)
+            {
+                _ = 2d.ConvertValue("m", "ft");
+                _ = 2d.ConvertValue("not-a-unit", "m");
+            }
+
+            // A warm lookup used to allocate on every call. A one-time runtime cost can remain; a per-call cost cannot.
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            Assert.That(allocated, Is.LessThan(64), $"allocated={allocated}");
         }
 
         [Test]
@@ -137,6 +203,7 @@ namespace StandardPluginTests
 
             var parquetFiles = Directory.GetFiles(firstFolder, "*.parquet");
             Assert.That(parquetFiles, Has.Length.EqualTo(1));
+            Assert.That(ReadGeometryTypes(parquetFiles[0]), Is.EqualTo(new[] { "Polygon" }));
             Assert.That(Directory.GetFiles(secondFolder, "*.parquet"), Has.Length.EqualTo(1));
 
             var adaptJson = File.ReadAllText(Path.Combine(firstFolder, "adapt.json"));
@@ -468,6 +535,71 @@ namespace StandardPluginTests
             Assert.That(rates, Is.Unique);
         }
 
+        [Test]
+        public void RejectedZeroFixDoesNotBecomeThePreviousPosition()
+        {
+            var adm = WorkRecordTestData.CreateStraightPassApplicationDataModel(recordCount: 3);
+            var loggedData = ((List<LoggedData>)adm.Documents.LoggedData).First();
+            var operation = ((List<OperationData>)loggedData.OperationData).First();
+            var records = operation.GetSpatialRecords().ToList();
+            records[1].Geometry = new AgGateway.ADAPT.ApplicationDataModel.Shapes.Point { X = 0d, Y = 0d };
+
+            var geometries = ExportFirstOperationGeometries(adm, "workrecord-rejected-fix");
+            Assert.That(geometries.Count, Is.EqualTo(2));
+            AssertPolygonOrientation(geometries[1], expectedBearingDeg: 0d, expectedLengthM: 1d);
+        }
+
+        [Test]
+        public void SummaryOnlyOperationKeepsItsIdAndOmitsTheSpatialFile()
+        {
+            var adm = WorkRecordTestData.CreateStraightPassApplicationDataModel(recordCount: 2);
+            var loggedData = ((List<LoggedData>)adm.Documents.LoggedData).First();
+            var operation = ((List<OperationData>)loggedData.OperationData).First();
+            foreach (var record in operation.GetSpatialRecords())
+            {
+                record.Geometry = new AgGateway.ADAPT.ApplicationDataModel.Shapes.Point { X = 0d, Y = 0d };
+            }
+
+            int productId = operation.ProductIds.First();
+            adm.Documents.Summaries = new List<Summary>
+            {
+                new Summary
+                {
+                    LoggedDataIds = new List<int> { loggedData.Id.ReferenceId },
+                    OperationSummaries = new List<OperationSummary>
+                    {
+                        new OperationSummary
+                        {
+                            OperationType = operation.OperationType,
+                            ProductId = productId,
+                            Data = new List<StampedMeteredValues>
+                            {
+                                new StampedMeteredValues
+                                {
+                                    Values = new List<MeteredValue>()
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            var folder = CreateCleanFolder("workrecord-summary-only");
+            var properties = new Properties();
+            properties.SetProperty("SourceGeometryPosition", SourceGeometryPosition.ImplementReferencePoint.ToString());
+            properties.SetProperty("SourceDeviceDefinition", SourceDeviceDefinition.Machine0Implement1Section2.ToString());
+            new Plugin().Export(adm, folder, properties);
+
+            Assert.That(Directory.GetFiles(folder, "*.parquet"), Is.Empty);
+            var json = File.ReadAllText(Path.Combine(folder, "adapt.json")).TrimStart('\uFEFF');
+            using (var document = JsonDocument.Parse(json))
+            {
+                var exported = document.RootElement.GetProperty("documents").GetProperty("workRecords")[0].GetProperty("operations")[0];
+                Assert.That(exported.GetProperty("id").GetProperty("referenceId").GetString(), Is.Not.Null.And.Not.Empty);
+                Assert.That(exported.TryGetProperty("spatialRecordsFile", out _), Is.False);
+            }
+        }
+
         private static List<(string ReferenceId, string SpatialFile)> ReadWorkRecordOperations(string folder)
         {
             var json = File.ReadAllText(Path.Combine(folder, "adapt.json")).TrimStart('\uFEFF');
@@ -483,6 +615,23 @@ namespace StandardPluginTests
                 }
 
                 return results;
+            }
+        }
+
+        private static string[] ReadGeometryTypes(string parquetPath)
+        {
+            using (var reader = new ParquetFileReader(parquetPath))
+            {
+                using (var document = JsonDocument.Parse(reader.FileMetaData.KeyValueMetadata["geo"]))
+                {
+                    return document.RootElement
+                        .GetProperty("columns")
+                        .GetProperty("geometry")
+                        .GetProperty("geometry_types")
+                        .EnumerateArray()
+                        .Select(item => item.GetString())
+                        .ToArray();
+                }
             }
         }
 

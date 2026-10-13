@@ -305,7 +305,8 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         private OperationElement ExportOperation(OperationDefinition operationDefinition, ApplicationDataModel.ADM.ApplicationDataModel model, WorkRecordElement workRecord, List<IError> errors)
         {
-            // The operation id and file name were reserved before spatial export.
+            // The operation id and file name were reserved before spatial export. An operation
+            // with no written rows keeps the id and does not name a parquet file.
             string operationType = Enum.GetName(typeof(AgGateway.ADAPT.ApplicationDataModel.Common.OperationTypeEnum), operationDefinition.OperationType);
             string referenceId = operationDefinition.OperationReferenceId;
             string outputFileName = operationDefinition.SpatialRecordsFile;
@@ -355,7 +356,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                 Name = name,
                 Variables = variables.Any() ? variables : null,
                 ProductIds = operationDefinition.ProductIds.Any() ? operationDefinition.ProductIds.Select(x => x.ToString(CultureInfo.InvariantCulture)).ToList() : null,
-                SpatialRecordsFile = outputFileName,
+                SpatialRecordsFile = operationDefinition.ColumnData.RowCount > 0 ? outputFileName : null,
                 GuidanceAllocations = guidanceAllocations.Any() ? guidanceAllocations : null,
                 PartyRoles = partyRoles.Any() ? partyRoles : null,
                 SummaryValues = ExportSummaryValues(operationDefinition, variables, errors)
@@ -604,7 +605,6 @@ namespace AgGateway.ADAPT.StandardPlugin
                         sectionWriters[sectionIndex].Section.ClearLeadingEdge();
                     }
 
-                    priorSpatialRecord = record;
                     continue;
                 }
 
@@ -612,12 +612,17 @@ namespace AgGateway.ADAPT.StandardPlugin
                 {
                     var sectionWriter = sectionWriters[sectionIndex];
                     var section = sectionWriter.Section;
-                    double bearing = context.ResolveBearing(record, sectionWriter.HeadingDefinition);
+                    double? previousHeading = section.TryGetLeadingHeading(out double leadingHeading) ? leadingHeading : null;
+                    double bearing = context.ResolveBearing(record, sectionWriter.HeadingDefinition, previousHeading);
                     double? reportedDistance = context.ResolveReportedDistance(record, sectionWriter.DistanceDefinition);
                     double? calculatedDistance = context.ResolveCalculatedDistance(reportedDistance);
-                    if (section.IsEngaged(record) &&
-                        timeDelta < 5d &&
-                        section.TryGetCoverageWkb(context, bearing, reportedDistance, calculatedDistance, out byte[] wkb, out CoverageBounds bounds))
+                    if (!section.IsEngaged(record) || timeDelta >= 5d)
+                    {
+                        section.ClearLeadingEdge();
+                        continue;
+                    }
+
+                    if (section.TryGetCoverageWkb(context, bearing, reportedDistance, calculatedDistance, out byte[] wkb, out CoverageBounds bounds))
                     {
                         var values = sectionValues[sectionIndex];
                         for (int columnIndex = 0; columnIndex < sectionWriter.ColumnWriters.Length; columnIndex++)
@@ -626,10 +631,6 @@ namespace AgGateway.ADAPT.StandardPlugin
                         }
 
                         writer.AddRow(record.Timestamp, values, wkb, bounds.MinX, bounds.MinY, bounds.MaxX, bounds.MaxY);
-                    }
-                    else
-                    {
-                        section.ClearLeadingEdge();
                     }
                 }
 

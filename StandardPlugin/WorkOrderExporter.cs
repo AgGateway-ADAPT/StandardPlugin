@@ -545,7 +545,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                         exportColumns.Add(new WorkOrderExportColumn()
                         {
                             Variable = variable,
-                            ConversionFactor = 1d.ConvertValue(frameworkRxProductLookup.UnitOfMeasure.Code, targetUOMCode),
+                            ConversionFactor = 1d.ConvertValue(frameworkRxProductLookup.UnitOfMeasure.Code, targetUOMCode).Value,
                             ProductLookup = frameworkRxProductLookup,
                         });
                     }
@@ -591,7 +591,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             columnData.AddVectorPrescription(srcRx, exportColumns, catalog, _commonExporters);
             var values = new double?[columnData.Columns.Count];
 
-            using (var writer = new ADAPTParquetWriter(columnData, includeTimestamps: false, openFile: () => outputPath))
+            using (var writer = new ADAPTParquetWriter(columnData, includeTimestamps: false, openFile: () => outputPath, geometryType: "MultiPolygon"))
             {
                 foreach (var shapeLookup in srcRx.RxShapeLookups)
                 {

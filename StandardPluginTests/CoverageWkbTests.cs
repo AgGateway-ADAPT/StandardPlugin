@@ -1,8 +1,11 @@
 using System;
+using AgGateway.ADAPT.ApplicationDataModel.LoggedData;
 using AgGateway.ADAPT.StandardPlugin;
 using NetTopologySuite.Geometries;
 using NetTopologySuite.IO;
 using NUnit.Framework;
+using AdaptPoint = AgGateway.ADAPT.ApplicationDataModel.Shapes.Point;
+using AdaptPolygon = AgGateway.ADAPT.ApplicationDataModel.Shapes.Polygon;
 
 namespace StandardPluginTests
 {
@@ -250,6 +253,130 @@ namespace StandardPluginTests
                 prior.LeftLon,
                 prior.LeftLat);
             Assert.That(new WKBReader().Read(wkb).IsValid, Is.False);
+        }
+
+        [Test]
+        public void TryCreateRejectsMissingOrZeroGeometry()
+        {
+            var record = new SpatialRecord();
+            Assert.That(CoverageRecordContext.TryCreate(record, null, out _), Is.False);
+
+            record.Geometry = new AdaptPolygon();
+            Assert.That(CoverageRecordContext.TryCreate(record, null, out _), Is.False);
+
+            record.Geometry = new AdaptPoint { X = 0d, Y = 0d };
+            Assert.That(CoverageRecordContext.TryCreate(record, null, out _), Is.False);
+
+            record.Geometry = new AdaptPoint { X = -87.60d, Y = 41.88d };
+            Assert.That(CoverageRecordContext.TryCreate(record, null, out _), Is.True);
+        }
+
+        [Test]
+        public void StoppedFixKeepsThePreviousLeadingEdge()
+        {
+            var geodesy = new LocalGeodesy(-87.60d, 41.88d);
+            LeadingEdge leadingEdge = default;
+            Assert.That(CoveragePolygonWriter.TryWrite(
+                geodesy,
+                new LocalPoint(0d, 0d),
+                10d,
+                ref leadingEdge,
+                0d,
+                reportedDistance: 1d,
+                calculatedDistance: null,
+                out _,
+                out _), Is.True);
+            double keptLeftLon = leadingEdge.LeftLon;
+
+            Assert.That(CoveragePolygonWriter.TryWrite(
+                geodesy,
+                new LocalPoint(0d, 0d),
+                10d,
+                ref leadingEdge,
+                0d,
+                reportedDistance: 0d,
+                calculatedDistance: 0d,
+                out _,
+                out _), Is.False);
+            Assert.That(leadingEdge.HasValue, Is.True);
+            Assert.That(leadingEdge.LeftLon, Is.EqualTo(keptLeftLon));
+
+            double movedLat = 41.88d + (2d / 111320d);
+            geodesy = new LocalGeodesy(-87.60d, movedLat);
+            Assert.That(CoveragePolygonWriter.TryWrite(
+                geodesy,
+                new LocalPoint(0d, 0d),
+                10d,
+                ref leadingEdge,
+                0d,
+                reportedDistance: null,
+                calculatedDistance: null,
+                out byte[] wkb,
+                out _), Is.True);
+            double backLeftLon = BitConverter.ToDouble(wkb, 61);
+            Assert.That(backLeftLon, Is.EqualTo(keptLeftLon).Within(1e-8d));
+        }
+
+        [Test]
+        public void StopWithoutReportedHeadingKeepsTheTravelHeading()
+        {
+            const double travelHeading = 90d;
+            var geodesy = new LocalGeodesy(-87.60d, 41.88d);
+            LeadingEdge leadingEdge = default;
+            Assert.That(CoveragePolygonWriter.TryWrite(
+                geodesy,
+                new LocalPoint(0d, 0d),
+                10d,
+                ref leadingEdge,
+                travelHeading,
+                reportedDistance: 1d,
+                calculatedDistance: null,
+                out _,
+                out _), Is.True);
+
+            var prior = new SpatialRecord { Geometry = new AdaptPoint { X = -87.60d, Y = 41.88d } };
+            var stopped = new SpatialRecord { Geometry = new AdaptPoint { X = -87.60d, Y = 41.88d } };
+            Assert.That(CoverageRecordContext.TryCreate(stopped, prior, out CoverageRecordContext stopContext), Is.True);
+            Assert.That(stopContext.ResolveBearing(stopped, headingDefinition: null), Is.EqualTo(0d).Within(1e-9d));
+            double bearing = stopContext.ResolveBearing(stopped, headingDefinition: null, previousHeading: leadingEdge.Heading);
+            Assert.That(bearing, Is.EqualTo(travelHeading));
+
+            double keptLeftLon = leadingEdge.LeftLon;
+            for (int stopIndex = 0; stopIndex < 2; stopIndex++)
+            {
+                Assert.That(CoveragePolygonWriter.TryWrite(
+                    stopContext.Geodesy,
+                    new LocalPoint(0d, 0d),
+                    10d,
+                    ref leadingEdge,
+                    bearing,
+                    reportedDistance: null,
+                    calculatedDistance: 0d,
+                    out _,
+                    out _), Is.False);
+                Assert.That(leadingEdge.Heading, Is.EqualTo(travelHeading));
+                Assert.That(leadingEdge.LeftLon, Is.EqualTo(keptLeftLon));
+            }
+
+            double metersPerDegreeLon = 111320d * Math.Cos(41.88d * Math.PI / 180d);
+            var resumed = new SpatialRecord
+            {
+                Geometry = new AdaptPoint { X = -87.60d + (2d / metersPerDegreeLon), Y = 41.88d }
+            };
+            Assert.That(CoverageRecordContext.TryCreate(resumed, stopped, out CoverageRecordContext resumeContext), Is.True);
+            double resumeBearing = resumeContext.ResolveBearing(resumed, headingDefinition: null, previousHeading: leadingEdge.Heading);
+            Assert.That(resumeBearing, Is.EqualTo(travelHeading).Within(1d));
+            Assert.That(CoveragePolygonWriter.TryWrite(
+                resumeContext.Geodesy,
+                new LocalPoint(0d, 0d),
+                10d,
+                ref leadingEdge,
+                resumeBearing,
+                reportedDistance: null,
+                calculatedDistance: resumeContext.ResolveCalculatedDistance(null),
+                out byte[] resumedWkb,
+                out _), Is.True);
+            Assert.That(BitConverter.ToDouble(resumedWkb, 61), Is.EqualTo(keptLeftLon).Within(1e-8d));
         }
 
         [TestCase(350d, 10d, false)]

@@ -74,7 +74,19 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         // Composite conversion repeats that dimension walk and allocates a unit on every call.
         // The result is an affine scale and offset, so it can be resolved once per unit pair.
-        private static readonly ConcurrentDictionary<(string Source, string Target), ValueConverter> ValueConverterCache = new ConcurrentDictionary<(string, string), ValueConverter>();
+        // A null converter is cached too: an unknown unit stays unknown without another lookup.
+        private static readonly ConcurrentDictionary<(string Source, string Target), CachedConverter> ValueConverterCache = new ConcurrentDictionary<(string, string), CachedConverter>();
+        private static readonly ValueConverter IdentityConverter = value => value;
+
+        private sealed class CachedConverter
+        {
+            internal CachedConverter(ValueConverter converter)
+            {
+                Converter = converter;
+            }
+
+            internal ValueConverter Converter { get; }
+        }
 
         public static bool CanConvert(string srcUnitCode, string targetUnitCode)
         {
@@ -83,14 +95,31 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         private static bool ComputeCanConvert(string srcUnitCode, string targetUnitCode)
         {
-            if (RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[targetUnitCode] != null &&
-                RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[srcUnitCode] != null)
+            if (TryGetUnit(targetUnitCode) != null &&
+                TryGetUnit(srcUnitCode) != null)
             {
                 var targetUOM = RepresentationUnitSystem.UnitSystemManager.GetUnitOfMeasure(targetUnitCode);
                 var sourceUOM = RepresentationUnitSystem.UnitSystemManager.GetUnitOfMeasure(srcUnitCode);
                 return sourceUOM.Dimension == targetUOM.Dimension;
             }
             return false;
+        }
+
+        private static RepresentationUnitSystem.UnitOfMeasure TryGetUnit(string unitCode)
+        {
+            if (string.IsNullOrEmpty(unitCode))
+            {
+                return null;
+            }
+
+            try
+            {
+                return RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[unitCode];
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
         }
 
         public static bool CanConvertInto(this UnitOfMeasure srcUOM, string targetUnitCode)
@@ -174,9 +203,15 @@ namespace AgGateway.ADAPT.StandardPlugin
             return value.Value.Value.ConvertValue(srcUnitCode, targetUnitCode);
         }
 
-        public static double ConvertValue(this double n, string srcUnitCode, string dstUnitCode)
+        public static double? ConvertValue(this double n, string srcUnitCode, string dstUnitCode)
         {
-            return GetValueConverter(srcUnitCode, dstUnitCode)(n);
+            ValueConverter converter = GetValueConverter(srcUnitCode, dstUnitCode);
+            if (converter == null)
+            {
+                return null;
+            }
+
+            return converter(n);
         }
 
         internal delegate double ValueConverter(double value);
@@ -199,19 +234,26 @@ namespace AgGateway.ADAPT.StandardPlugin
         {
             if (srcUnitCode == dstUnitCode)
             {
-                return value => value;
+                return IdentityConverter;
             }
 
-            return ValueConverterCache.GetOrAdd((srcUnitCode, dstUnitCode), key => CreateValueConverter(key.Source, key.Target));
+            var key = (Source: srcUnitCode, Target: dstUnitCode);
+            if (ValueConverterCache.TryGetValue(key, out CachedConverter cached))
+            {
+                return cached.Converter;
+            }
+
+            cached = ValueConverterCache.GetOrAdd(key, new CachedConverter(CreateValueConverter(srcUnitCode, dstUnitCode)));
+            return cached.Converter;
         }
 
         private static ValueConverter CreateValueConverter(string srcUnitCode, string dstUnitCode)
         {
-            RepresentationUnitSystem.UnitOfMeasure sourceUOM = RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[srcUnitCode];
-            RepresentationUnitSystem.UnitOfMeasure targetUOM = RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[dstUnitCode];
+            RepresentationUnitSystem.UnitOfMeasure sourceUOM = TryGetUnit(srcUnitCode);
+            RepresentationUnitSystem.UnitOfMeasure targetUOM = TryGetUnit(dstUnitCode);
             if (sourceUOM == null || targetUOM == null)
             {
-                return value => value;
+                return null;
             }
 
             // ADAPT units are a scale and an offset, so two conversions define every later value:
