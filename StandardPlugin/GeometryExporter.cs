@@ -169,12 +169,65 @@ namespace AgGateway.ADAPT.StandardPlugin
             return r * (180d / Math.PI);
         }
 
+        internal static double Distance(Point point1, Point point2)
+        {
+            return Distance(point1.X, point1.Y, point2.X, point2.Y);
+        }
+
+        // Use the local grid for short spans; retain haversine outside its validated range.
+        internal static double Distance(double lon1, double lat1, double lon2, double lat2)
+        {
+            var geodesy = new LocalGeodesy(lon2, lat2);
+            double distanceM = geodesy.DistanceBetween(lon1, lat1, lon2, lat2);
+            if (geodesy.IsWithinValidatedEnvelope(distanceM))
+            {
+                return distanceM;
+            }
+
+            return HaversineDistance(lon1, lat1, lon2, lat2);
+        }
+
+        internal static double Bearing(Point point1, Point point2)
+        {
+            return Bearing(point1.X, point1.Y, point2.X, point2.Y);
+        }
+
+        // Use the same local/haversine boundary as Distance.
+        internal static double Bearing(double lon1, double lat1, double lon2, double lat2)
+        {
+            var geodesy = new LocalGeodesy(lon2, lat2);
+            double distanceM = geodesy.DistanceBetween(lon1, lat1, lon2, lat2);
+            if (geodesy.IsWithinValidatedEnvelope(distanceM))
+            {
+                return geodesy.BearingBetween(lon1, lat1, lon2, lat2);
+            }
+
+            return HaversineBearing(lon1, lat1, lon2, lat2);
+        }
+
+        // Coverage offsets use the local grid; longer destinations retain haversine.
+        internal static Point Destination(Point startPoint, double distanceM, double headingDeg)
+        {
+            var geodesy = new LocalGeodesy(startPoint.X, startPoint.Y);
+            if (geodesy.IsWithinValidatedEnvelope(distanceM))
+            {
+                return geodesy.DestinationFromOrigin(distanceM, headingDeg);
+            }
+
+            return HaversineDestination(startPoint, distanceM, headingDeg);
+        }
+
         internal static double HaversineDistance(Point point1, Point point2)
         {
-            double latRad1 = DegreesToRads(point1.Y);
-            double latRad2 = DegreesToRads(point2.Y);
-            double deltaLat = DegreesToRads(point2.Y - point1.Y);
-            double deltaLon = DegreesToRads(point2.X - point1.X);
+            return HaversineDistance(point1.X, point1.Y, point2.X, point2.Y);
+        }
+
+        internal static double HaversineDistance(double lon1, double lat1, double lon2, double lat2)
+        {
+            double latRad1 = DegreesToRads(lat1);
+            double latRad2 = DegreesToRads(lat2);
+            double deltaLat = DegreesToRads(lat2 - lat1);
+            double deltaLon = DegreesToRads(lon2 - lon1);
             double a = Math.Pow(Math.Sin(deltaLat / 2d), 2) + Math.Cos(latRad1) * Math.Cos(latRad2) * Math.Pow(Math.Sin(deltaLon / 2d), 2);
             double c = 2d * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
             return c * EarthRadiusM;
@@ -182,10 +235,15 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         internal static double HaversineBearing(Point point1, Point point2)
         {
-            double latRad1 = DegreesToRads(point1.Y);
-            double latRad2 = DegreesToRads(point2.Y);
-            double lonRad1 = DegreesToRads(point1.X);
-            double lonRad2 = DegreesToRads(point2.X);
+            return HaversineBearing(point1.X, point1.Y, point2.X, point2.Y);
+        }
+
+        internal static double HaversineBearing(double lon1, double lat1, double lon2, double lat2)
+        {
+            double latRad1 = DegreesToRads(lat1);
+            double latRad2 = DegreesToRads(lat2);
+            double lonRad1 = DegreesToRads(lon1);
+            double lonRad2 = DegreesToRads(lon2);
             double a = Math.Sin(lonRad2 - lonRad1) * Math.Cos(latRad2);
             double b = Math.Cos(latRad1) * Math.Sin(latRad2) - Math.Sin(latRad1) * Math.Cos(latRad2) * Math.Cos(lonRad2 - lonRad1);
             double rad = Math.Atan2(a, b);

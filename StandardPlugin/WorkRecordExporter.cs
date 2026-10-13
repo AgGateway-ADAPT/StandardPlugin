@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.ApplicationDataModel.Common;
 using AgGateway.ADAPT.ApplicationDataModel.Documents;
@@ -18,12 +20,17 @@ namespace AgGateway.ADAPT.StandardPlugin
         private readonly SourceDeviceDefinition _deviceDefinition;
         private readonly CommonExporters _commonExporters;
         private readonly Standard.Root _root;
-        private int _variableCounter;
         private readonly string _exportPath;
-        private List<string> _operationIds = new List<string>();
+        private readonly Properties _properties;
+        private readonly bool _multithread;
+        private readonly int _maxParallelism;
+        private readonly ExportIdAllocator _idAllocator;
         private WorkRecordExporter(Root root, string exportPath, Properties properties)
         {
-            _variableCounter = 0;
+            _properties = properties;
+            _multithread = ExportSettings.UseMultithread(properties);
+            _maxParallelism = ExportSettings.GetMaxParallelism(properties);
+            _idAllocator = new ExportIdAllocator();
             _exportPath = exportPath;
             _root = root;
             _root.Documents.WorkRecords = new List<WorkRecordElement>();
@@ -70,183 +77,22 @@ namespace AgGateway.ADAPT.StandardPlugin
         {
             List<IError> errors = new List<IError>();
             Directory.CreateDirectory(_exportPath);
-            foreach (var fieldIdGroupBy in model.Documents.LoggedData.GroupBy(ld => ld.FieldId))
+            var fieldGroups = model.Documents.LoggedData.GroupBy(ld => ld.FieldId).Select((group, index) => new { group, index }).ToList();
+
+            for (int i = 0; i < fieldGroups.Count; i++)
             {
-                List<OperationDefinition> groupedOperations = new List<OperationDefinition>();
-                foreach (var fieldLoggedData in fieldIdGroupBy)
+                var fieldResult = ExportFieldGroup(fieldGroups[i].group, fieldGroups[i].index, model);
+                if (fieldResult.WorkRecord != null)
                 {
-                    //Group the operations with spatial data
-                    foreach (var operationData in GetMappableOperations(fieldLoggedData))
-                    {
-                        Implement implement = new Implement(operationData, model.Catalog, _geometryPositition, _deviceDefinition, _commonExporters.TypeMappings, errors);
-
-                        //Output grouping
-                        OperationDefinition operationDefinition = new OperationDefinition(implement, operationData, fieldLoggedData);
-                        var matchingOperation = groupedOperations.FirstOrDefault(x => x.IsMatchingOperation(operationDefinition));
-                        if (matchingOperation != null)
-                        {
-                            //This is the logical equivalent of another operation
-                            matchingOperation.SourceOperations.Add(new ConstituentSpatialOperation(operationData, implement));
-                            matchingOperation.SourceLoggedDatas.Add(fieldLoggedData);
-                        }
-                        else
-                        {
-                            //First one in this group
-                            //Add the columns for parquet
-                            errors.AddRange(operationDefinition.ColumnData.AddOperationData(operationData, model.Catalog, implement, _commonExporters));
-
-                            if (operationDefinition.ColumnData.Columns.Any())
-                            {
-                                groupedOperations.Add(operationDefinition);
-                            }
-                            else
-                            {
-                                //This operation did not match any variable to export
-                                continue;
-                            }
-
-                            //Add the variables for the output operation
-                            VariableElement timestamp = new VariableElement()
-                            {
-                                Name = "Timestamp",
-                                DefinitionCode = "Timestamp",
-                                Id = new Id() { ReferenceId = string.Concat(operationDefinition.Key(), "-timestamp") },
-                                GeoParquetColumnName = "Timestamp"
-                            };
-                            operationDefinition.VariablesByOutputName.Add("Timestamp", timestamp);
-                            foreach (var dataColumn in operationDefinition.ColumnData.Columns)
-                            {
-                                if (!operationDefinition.VariablesByOutputName.ContainsKey(dataColumn.TargetName))
-                                {
-                                    VariableElement variable = new VariableElement()
-                                    {
-                                        Name = dataColumn.SrcName,
-                                        DefinitionCode = dataColumn.TargetCode,
-                                        ProductId = dataColumn.ProductId,
-                                        Id = _commonExporters.ExportID(dataColumn.SrcWorkingData.Id),
-                                        GeoParquetColumnName = dataColumn.TargetName
-                                    };
-                                    operationDefinition.VariablesByOutputName.Add(dataColumn.TargetName, variable);
-                                }
-                            }
-                        }
-                    }
+                    _root.Documents.WorkRecords.Add(fieldResult.WorkRecord);
                 }
 
-                //Add the summary data
-                HashSet<Summary> sourceSummaries = new HashSet<Summary>();
-                foreach (var loggedData in fieldIdGroupBy)
+                errors.AddRange(fieldResult.Errors);
+                // Release this field after its operations have finished, including when they ran
+                // concurrently. The next field does not start until this release returns.
+                foreach (var loggedData in fieldResult.LoggedDataToRelease)
                 {
-                    var summary = model.Documents.Summaries.FirstOrDefault(x => x.LoggedDataIds.Contains(loggedData.Id.ReferenceId) || x.Id.ReferenceId == loggedData.SummaryId);
-                    if (summary != null)
-                    {
-                        sourceSummaries.Add(summary);
-                    }
-                }
-                foreach (var sourceSummary in sourceSummaries)
-                {
-                    if (sourceSummary.OperationSummaries != null &&
-                        sourceSummary.OperationSummaries.Any())
-                    {
-                        foreach (var srcOpSummary in sourceSummary.OperationSummaries)
-                        {
-                            //var opSummaryMatched = false;
-                            foreach (var groupedOperation in groupedOperations)
-                            {
-                                if (groupedOperation.IsMatchingOperationSummary(srcOpSummary))
-                                {
-                                    if (!groupedOperation.SourceSummaryValuesByProductId.ContainsKey(srcOpSummary.ProductId))
-                                    {
-                                        groupedOperation.SourceSummaryValuesByProductId.Add(srcOpSummary.ProductId, new List<StampedMeteredValues>());
-                                    }
-                                    groupedOperation.SourceSummaryValuesByProductId[srcOpSummary.ProductId].AddRange(srcOpSummary.Data);
-                                    //opSummaryMatched = true;
-                                    break; //Operation Summary should only match to a single output
-                                }
-                            }
-                            // if (!opSummaryMatched)
-                            // {
-                            //     //Possible enhancement. Summary only operations
-                            // }
-                        }
-                    }
-                    else if (groupedOperations.Count == 1 &&
-                          groupedOperations.First().IsMatchingSummary(sourceSummary))
-                    {
-                        //There is a single operation so we can match the summary
-                        groupedOperations.First().SourceSummaryValuesWithoutProduct.AddRange(sourceSummary.SummaryData);
-                    }
-                    else if (!groupedOperations.Any())
-                    {
-                        //Possible enhancement. Summary only operations
-                    }
-                    else
-                    {
-                        errors.Add(new Error
-                        {
-                            Id = sourceSummary.Id.ReferenceId.ToString(CultureInfo.InvariantCulture),
-                            Description = "Did not convert summary; could not map to an operation.",
-                        });
-                    }
-                }
-
-
-                if (groupedOperations.Any())
-                {
-                    var workRecordId = fieldIdGroupBy.Count() == 1 ? _commonExporters.ExportID(fieldIdGroupBy.First().Id) : new Id() { ReferenceId = string.Concat("field_", fieldIdGroupBy.First().FieldId?.ToString(), "_WorkRecord") };
-                    var cropZoneId = fieldIdGroupBy.Count() == 1 ? fieldIdGroupBy.First().CropZoneId?.ToString(CultureInfo.InvariantCulture) : null;
-                    var notes = fieldIdGroupBy.SelectMany(x => x.Notes).Any() ? fieldIdGroupBy.SelectMany(x => x.Notes).Select(y => y.Description).ToList() : null;
-                    List<TimeScopeElement> timeScopeElements = new List<TimeScopeElement>();
-                    string seasonId = null;
-                    foreach (var loggedData in fieldIdGroupBy.ToList())
-                    {
-                        var timeScopes = _commonExporters.ExportTimeScopes(loggedData.TimeScopes, out var seasonIds);
-                        if (timeScopes != null)
-                        {
-                            timeScopeElements.AddRange(timeScopes);
-                        }
-                        if (seasonIds.Any())
-                        {
-                            seasonId = seasonIds.First();
-                        }
-                    }
-
-                    var name = string.Join("_", fieldIdGroupBy.ToList().Select(x => x.Description));
-                    var fieldWorkRecord = new WorkRecordElement
-                    {
-                        Operations = new List<OperationElement>(),
-                        FieldId = groupedOperations.First().FieldId,
-                        Id = workRecordId,
-                        CropZoneId = cropZoneId,
-                        Name = string.Join("_", fieldIdGroupBy.ToList().Select(x => x.Description)),
-                        Notes = notes,
-                        TimeScopes = timeScopeElements.Any() ? timeScopeElements : null,
-                        SeasonId = seasonId
-                    };
-                    _root.Documents.WorkRecords.Add(fieldWorkRecord);
-
-                    //Having grouped the OperationData objects, export them
-                    foreach (var operationDefinition in groupedOperations)
-                    {
-                        foreach (var constituentSpatialOperation in operationDefinition.SourceOperations)
-                        {
-                            //Export the spatial records into the parquet
-                            ExportOperationSpatialRecords(operationDefinition.ColumnData, constituentSpatialOperation.Implement, constituentSpatialOperation.OperationData);
-                        }
-                        //Export the header & write out the parquet for this operation
-                        if (operationDefinition.ColumnData.Geometries.Count > 0 || operationDefinition.SourceSummaryValuesByProductId.Any() || operationDefinition.SourceSummaryValuesWithoutProduct.Any())
-                        {
-                            ExportOperation(operationDefinition, model, fieldWorkRecord, errors);
-                        }
-                    }
-                }
-
-                foreach (var loggedData in fieldIdGroupBy)
-                {
-                    if (loggedData.ReleaseSpatialData != null)
-                    {
-                        loggedData.ReleaseSpatialData();
-                    }
+                    loggedData.ReleaseSpatialData?.Invoke();
                 }
             }
 
@@ -259,34 +105,216 @@ namespace AgGateway.ADAPT.StandardPlugin
             return errors;
         }
 
-        private void ExportOperation(OperationDefinition operationDefinition, ApplicationDataModel.ADM.ApplicationDataModel model, WorkRecordElement workRecord, List<IError> errors)
+        private FieldExportResult ExportFieldGroup(IGrouping<int?, LoggedData> fieldIdGroupBy, int fieldIndex, ApplicationDataModel.ADM.ApplicationDataModel model)
         {
-            //Give the parquet file a meaningful name
+            FieldExportResult result = new FieldExportResult { FieldIndex = fieldIndex };
+            List<IError> errors = result.Errors;
+            List<OperationDefinition> groupedOperations = new List<OperationDefinition>();
+            foreach (var fieldLoggedData in fieldIdGroupBy)
+            {
+                foreach (var operationData in GetMappableOperations(fieldLoggedData))
+                {
+                    Implement implement = new Implement(operationData, model.Catalog, _geometryPositition, _deviceDefinition, _commonExporters.TypeMappings, errors);
+
+                    OperationDefinition operationDefinition = new OperationDefinition(implement, operationData, fieldLoggedData);
+                    var matchingOperation = groupedOperations.FirstOrDefault(x => x.IsMatchingOperation(operationDefinition));
+                    if (matchingOperation != null)
+                    {
+                        matchingOperation.SourceOperations.Add(new ConstituentSpatialOperation(operationData, implement));
+                        matchingOperation.SourceLoggedDatas.Add(fieldLoggedData);
+                    }
+                    else
+                    {
+                        errors.AddRange(operationDefinition.ColumnData.AddOperationData(operationData, model.Catalog, implement, _commonExporters));
+
+                        if (operationDefinition.ColumnData.Columns.Any())
+                        {
+                            groupedOperations.Add(operationDefinition);
+                        }
+                        else
+                        {
+                            continue;
+                        }
+
+                        VariableElement timestamp = new VariableElement()
+                        {
+                            Name = "Timestamp",
+                            DefinitionCode = "Timestamp",
+                            Id = new Id() { ReferenceId = string.Concat(operationDefinition.Key(), "-timestamp") },
+                            GeoParquetColumnName = "Timestamp"
+                        };
+                        operationDefinition.VariablesByOutputName.Add("Timestamp", timestamp);
+                        foreach (var dataColumn in operationDefinition.ColumnData.Columns)
+                        {
+                            if (!operationDefinition.VariablesByOutputName.ContainsKey(dataColumn.TargetName))
+                            {
+                                VariableElement variable = new VariableElement()
+                                {
+                                    Name = dataColumn.SrcName,
+                                    DefinitionCode = dataColumn.TargetCode,
+                                    ProductId = dataColumn.ProductId,
+                                    Id = _commonExporters.ExportID(dataColumn.SrcWorkingData.Id),
+                                    GeoParquetColumnName = dataColumn.TargetName
+                                };
+                                operationDefinition.VariablesByOutputName.Add(dataColumn.TargetName, variable);
+                            }
+                        }
+                    }
+                }
+            }
+
+            HashSet<Summary> sourceSummaries = new HashSet<Summary>();
+            foreach (var loggedData in fieldIdGroupBy)
+            {
+                var summary = model.Documents.Summaries.FirstOrDefault(x => x.LoggedDataIds.Contains(loggedData.Id.ReferenceId) || x.Id.ReferenceId == loggedData.SummaryId);
+                if (summary != null)
+                {
+                    sourceSummaries.Add(summary);
+                }
+            }
+            foreach (var sourceSummary in sourceSummaries)
+            {
+                if (sourceSummary.OperationSummaries != null &&
+                    sourceSummary.OperationSummaries.Any())
+                {
+                    foreach (var srcOpSummary in sourceSummary.OperationSummaries)
+                    {
+                        foreach (var groupedOperation in groupedOperations)
+                        {
+                            if (groupedOperation.IsMatchingOperationSummary(srcOpSummary))
+                            {
+                                if (!groupedOperation.SourceSummaryValuesByProductId.ContainsKey(srcOpSummary.ProductId))
+                                {
+                                    groupedOperation.SourceSummaryValuesByProductId.Add(srcOpSummary.ProductId, new List<StampedMeteredValues>());
+                                }
+                                groupedOperation.SourceSummaryValuesByProductId[srcOpSummary.ProductId].AddRange(srcOpSummary.Data);
+                                break;
+                            }
+                        }
+                    }
+                }
+                else if (groupedOperations.Count == 1 &&
+                      groupedOperations.First().IsMatchingSummary(sourceSummary))
+                {
+                    groupedOperations.First().SourceSummaryValuesWithoutProduct.AddRange(sourceSummary.SummaryData);
+                }
+                else if (!groupedOperations.Any())
+                {
+                }
+                else
+                {
+                    errors.Add(new Error
+                    {
+                        Id = sourceSummary.Id.ReferenceId.ToString(CultureInfo.InvariantCulture),
+                        Description = "Did not convert summary; could not map to an operation.",
+                    });
+                }
+            }
+
+            if (groupedOperations.Any())
+            {
+                var workRecordId = fieldIdGroupBy.Count() == 1 ? _commonExporters.ExportID(fieldIdGroupBy.First().Id) : new Id() { ReferenceId = string.Concat("field_", fieldIdGroupBy.First().FieldId?.ToString(), "_WorkRecord") };
+                var cropZoneId = fieldIdGroupBy.Count() == 1 ? fieldIdGroupBy.First().CropZoneId?.ToString(CultureInfo.InvariantCulture) : null;
+                var notes = fieldIdGroupBy.SelectMany(x => x.Notes).Any() ? fieldIdGroupBy.SelectMany(x => x.Notes).Select(y => y.Description).ToList() : null;
+                List<TimeScopeElement> timeScopeElements = new List<TimeScopeElement>();
+                string seasonId = null;
+                foreach (var loggedData in fieldIdGroupBy.ToList())
+                {
+                    var timeScopes = _commonExporters.ExportTimeScopes(loggedData.TimeScopes, out var seasonIds);
+                    if (timeScopes != null)
+                    {
+                        timeScopeElements.AddRange(timeScopes);
+                    }
+                    if (seasonIds.Any())
+                    {
+                        seasonId = seasonIds.First();
+                    }
+                }
+
+                var fieldWorkRecord = new WorkRecordElement
+                {
+                    Operations = new List<OperationElement>(),
+                    FieldId = groupedOperations.First().FieldId,
+                    Id = workRecordId,
+                    CropZoneId = cropZoneId,
+                    Name = string.Join("_", fieldIdGroupBy.ToList().Select(x => x.Description)),
+                    Notes = notes,
+                    TimeScopes = timeScopeElements.Any() ? timeScopeElements : null,
+                    SeasonId = seasonId
+                };
+
+                // Ids and file names are reserved in list order before any writer opens.
+                // Spatial export may then run concurrently. Operation elements, including total-N
+                // variable ids, are built afterward in that same order.
+                ReserveOperationOutputs(groupedOperations, model);
+                if (!_multithread || groupedOperations.Count <= 1)
+                {
+                    foreach (var operationDefinition in groupedOperations)
+                    {
+                        ExportOperationSpatialData(operationDefinition, model);
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        Parallel.For(0, groupedOperations.Count, new ParallelOptions { MaxDegreeOfParallelism = _maxParallelism }, operationIndex =>
+                        {
+                            ExportOperationSpatialData(groupedOperations[operationIndex], model);
+                        });
+                    }
+                    catch (AggregateException aggregate) when (aggregate.InnerExceptions.Count == 1)
+                    {
+                        ExceptionDispatchInfo.Capture(aggregate.InnerExceptions[0]).Throw();
+                    }
+                }
+
+                foreach (var operationDefinition in groupedOperations)
+                {
+                    if (operationDefinition.ColumnData.RowCount > 0 ||
+                        operationDefinition.SourceSummaryValuesByProductId.Any() ||
+                        operationDefinition.SourceSummaryValuesWithoutProduct.Any())
+                    {
+                        fieldWorkRecord.Operations.Add(ExportOperation(operationDefinition, model, fieldWorkRecord, errors));
+                    }
+                }
+
+                result.WorkRecord = fieldWorkRecord;
+            }
+
+            result.LoggedDataToRelease.AddRange(fieldIdGroupBy);
+            return result;
+        }
+
+
+        private void ExportOperationSpatialData(OperationDefinition operationDefinition, ApplicationDataModel.ADM.ApplicationDataModel model)
+        {
+            using (var writer = new ADAPTParquetWriter(
+                operationDefinition.ColumnData,
+                includeTimestamps: true,
+                openFile: () => Path.Combine(_exportPath, operationDefinition.SpatialRecordsFile)))
+            {
+                foreach (var constituentSpatialOperation in operationDefinition.SourceOperations)
+                {
+                    ExportOperationSpatialRecords(writer, constituentSpatialOperation.Implement, constituentSpatialOperation.OperationData);
+                }
+
+                writer.Complete();
+            }
+        }
+
+        private OperationElement ExportOperation(OperationDefinition operationDefinition, ApplicationDataModel.ADM.ApplicationDataModel model, WorkRecordElement workRecord, List<IError> errors)
+        {
+            // The operation id and file name were reserved before spatial export.
             string operationType = Enum.GetName(typeof(AgGateway.ADAPT.ApplicationDataModel.Common.OperationTypeEnum), operationDefinition.OperationType);
-            string products = "";
-            if (operationDefinition.ProductIds.Any())
+            string referenceId = operationDefinition.OperationReferenceId;
+            string outputFileName = operationDefinition.SpatialRecordsFile;
+            if (referenceId == null)
             {
-                products = "_" + operationDefinition.ProductIds
-                            .Select(r =>
-                                model.Catalog.Products.First(p =>
-                                    p.Id.ReferenceId == r).Description)
-                            .Aggregate((i, j) => i + "_" + j);
+                outputFileName = CreateOperationFileName(operationDefinition, model, out referenceId);
             }
-            string candidateName = string.Concat(operationType, products);
-            string uniqueName = candidateName;
-            int opNameCounter = 1;
-            while (_operationIds.Contains(uniqueName))
-            {
-                uniqueName = string.Concat(candidateName, "_", opNameCounter++);
-            }
-            _operationIds.Add(uniqueName);
-            string outputFileName = string.Concat(uniqueName, ".parquet");
-            outputFileName = new string(outputFileName.Where(c => !Path.GetInvalidFileNameChars().Contains(c)).ToArray());
-            if (outputFileName.Length > 255)
-            {
-                outputFileName = outputFileName.Substring(0, 255);
-            }
-            var id = new Id() { ReferenceId = uniqueName };
+
+            var id = new Id() { ReferenceId = referenceId };
             var variables = operationDefinition.VariablesByOutputName.Values.ToList();
             string joinedName = string.Join("_", operationDefinition.SourceOperations.Select(x => x.OperationData.Description));
             string name = string.IsNullOrEmpty(joinedName) ? workRecord.Name + "_" + operationType : joinedName;
@@ -337,20 +365,8 @@ namespace AgGateway.ADAPT.StandardPlugin
 
             ExportLoad(operationDefinition.SourceOperations.Select(x => x.OperationData), model.Documents.Loads, outputOperation);
 
-            //Output any spatial data
-            if (operationDefinition.ColumnData.Geometries.Any())
+            if (operationDefinition.ColumnData.RowCount > 0)
             {
-                string outputFile = Path.Combine(_exportPath, outputFileName);
-                int duplicateIndex = 1;
-                while (File.Exists(outputFile))
-                {
-                    var newName = string.Concat(Path.GetFileNameWithoutExtension(outputFileName), "_", duplicateIndex++.ToString(), Path.GetExtension(outputFileName));
-                    outputFile = Path.Combine(_exportPath, newName);
-                    outputOperation.SpatialRecordsFile = newName;
-                }
-                ADAPTParquetWriter writer = new ADAPTParquetWriter(operationDefinition.ColumnData);
-                writer.Write(outputFile);
-
                 if (outputOperation.TimeScopes == null)
                 {
                     outputOperation.TimeScopes = new();
@@ -362,7 +378,54 @@ namespace AgGateway.ADAPT.StandardPlugin
                     End = operationDefinition.ColumnData.MaxTimestamp?.ToString("O", CultureInfo.InvariantCulture)
                 });
             }
-            workRecord.Operations.Add(outputOperation);
+            return outputOperation;
+        }
+
+        private void ReserveOperationOutputs(IReadOnlyList<OperationDefinition> groupedOperations, ApplicationDataModel.ADM.ApplicationDataModel model)
+        {
+            var reservedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (Directory.Exists(_exportPath))
+            {
+                foreach (string existingPath in Directory.EnumerateFiles(_exportPath))
+                {
+                    reservedNames.Add(Path.GetFileName(existingPath));
+                }
+            }
+
+            foreach (OperationDefinition operationDefinition in groupedOperations)
+            {
+                string allocatedFileName = CreateOperationFileName(operationDefinition, model, out string referenceId);
+                string outputFileName = allocatedFileName;
+                string stem = Path.GetFileNameWithoutExtension(allocatedFileName);
+                string extension = Path.GetExtension(allocatedFileName);
+                int duplicateIndex = 1;
+                while (reservedNames.Contains(outputFileName))
+                {
+                    outputFileName = string.Concat(stem, "_", duplicateIndex.ToString(CultureInfo.InvariantCulture), extension);
+                    duplicateIndex++;
+                }
+
+                reservedNames.Add(outputFileName);
+                operationDefinition.OperationReferenceId = referenceId;
+                operationDefinition.SpatialRecordsFile = outputFileName;
+            }
+        }
+
+        private string CreateOperationFileName(OperationDefinition operationDefinition, ApplicationDataModel.ADM.ApplicationDataModel model, out string referenceId)
+        {
+            string operationType = Enum.GetName(typeof(AgGateway.ADAPT.ApplicationDataModel.Common.OperationTypeEnum), operationDefinition.OperationType);
+            string products = "";
+            if (operationDefinition.ProductIds.Any())
+            {
+                products = "_" + operationDefinition.ProductIds
+                            .Select(r =>
+                                model.Catalog.Products.First(p =>
+                                    p.Id.ReferenceId == r).Description)
+                            .Aggregate((i, j) => i + "_" + j);
+            }
+            string candidateName = string.Concat(operationType, products);
+            referenceId = _idAllocator.AllocateOperationId(candidateName);
+            return SanitizeFileName(string.Concat(referenceId, ".parquet"));
         }
 
         private void AppendSummaryValue(StampedMeteredValues srcValues, List<VariableElement> variables, List<SummaryValueElement> output, List<IError> errors, int? productId = null)
@@ -440,7 +503,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                 {
                     DefinitionCode = _commonExporters.TypeMappings.First(m => m.Source == srcVariableName).Target,
                     Name = srcVariableName,
-                    Id = new Id { ReferenceId = string.Format(CultureInfo.InvariantCulture, "total-{0}", ++_variableCounter) },
+                    Id = new Id { ReferenceId = string.Format(CultureInfo.InvariantCulture, "total-{0}", _idAllocator.AllocateVariableId()) },
                     ProductId = productId?.ToString()
                 };
                 variables.Add(variableElement);
@@ -463,7 +526,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                     variableElement = new VariableElement
                     {
                         Name = srcLoad.LoadNumber,
-                        Id = new Id { ReferenceId = string.Format(CultureInfo.InvariantCulture, "total-{0}", ++_variableCounter) }
+                        Id = new Id { ReferenceId = string.Format(CultureInfo.InvariantCulture, "total-{0}", _idAllocator.AllocateVariableId()) }
                     };
                     operationElement.Variables.Add(variableElement);
                 }
@@ -489,81 +552,87 @@ namespace AgGateway.ADAPT.StandardPlugin
             operationElement.HarvestLoadIdentifier = srcLoad?.LoadNumber;
         }
 
-        private void ExportOperationSpatialRecords(ADAPTParquetColumnData runningOutput, Implement implement, OperationData operationData)
+        private static readonly char[] InvalidFileNameCharacters = Path.GetInvalidFileNameChars();
+
+        private static string SanitizeFileName(string outputFileName)
         {
+            char[] sanitized = new char[outputFileName.Length];
+            int length = 0;
+            foreach (char character in outputFileName)
+            {
+                if (Array.IndexOf(InvalidFileNameCharacters, character) < 0)
+                {
+                    sanitized[length++] = character;
+                }
+            }
+
+            if (length > 255)
+            {
+                length = 255;
+            }
+
+            return new string(sanitized, 0, length);
+        }
+
+        private void ExportOperationSpatialRecords(ADAPTParquetWriter writer, Implement implement, OperationData operationData)
+        {
+            SectionSpatialWriter[] sectionWriters = SectionSpatialWriter.CreateWriters(implement, writer.ColumnData);
+            if (sectionWriters.Length == 0)
+            {
+                return;
+            }
+
+            var sectionValues = new double?[sectionWriters.Length][];
+            for (int sectionIndex = 0; sectionIndex < sectionWriters.Length; sectionIndex++)
+            {
+                sectionValues[sectionIndex] = new double?[sectionWriters[sectionIndex].ColumnWriters.Length];
+            }
+
             SpatialRecord priorSpatialRecord = null;
             foreach (var record in operationData.GetSpatialRecords())
             {
-                foreach (var section in implement.Sections)
+                double timeDelta = 0d;
+                if (priorSpatialRecord != null)
                 {
-                    double timeDelta = 0d;
-                    if (priorSpatialRecord != null)
+                    timeDelta = (record.Timestamp - priorSpatialRecord.Timestamp).TotalSeconds;
+                }
+
+                if (!CoverageRecordContext.TryCreate(record, priorSpatialRecord, out CoverageRecordContext context))
+                {
+                    for (int sectionIndex = 0; sectionIndex < sectionWriters.Length; sectionIndex++)
                     {
-                        timeDelta = (record.Timestamp - priorSpatialRecord.Timestamp).TotalSeconds;
+                        sectionWriters[sectionIndex].Section.ClearLeadingEdge();
                     }
+
+                    priorSpatialRecord = record;
+                    continue;
+                }
+
+                for (int sectionIndex = 0; sectionIndex < sectionWriters.Length; sectionIndex++)
+                {
+                    var sectionWriter = sectionWriters[sectionIndex];
+                    var section = sectionWriter.Section;
+                    double bearing = context.ResolveBearing(record, sectionWriter.HeadingDefinition);
+                    double? reportedDistance = context.ResolveReportedDistance(record, sectionWriter.DistanceDefinition);
+                    double? calculatedDistance = context.ResolveCalculatedDistance(reportedDistance);
                     if (section.IsEngaged(record) &&
-                                timeDelta < 5d &&
-                                section.TryGetCoveragePolygon(record, priorSpatialRecord, out NetTopologySuite.Geometries.Polygon polygon))
+                        timeDelta < 5d &&
+                        section.TryGetCoverageWkb(context, bearing, reportedDistance, calculatedDistance, out byte[] wkb, out CoverageBounds bounds))
                     {
-                        runningOutput.Geometries.Add(polygon.ToBinary());
-                        if (runningOutput.BoundingBox == null)
+                        var values = sectionValues[sectionIndex];
+                        for (int columnIndex = 0; columnIndex < sectionWriter.ColumnWriters.Length; columnIndex++)
                         {
-                            runningOutput.BoundingBox = polygon.EnvelopeInternal;
-                        }
-                        else
-                        {
-                            runningOutput.BoundingBox.ExpandToInclude(polygon.EnvelopeInternal);
+                            values[columnIndex] = sectionWriter.ColumnWriters[columnIndex].GetValue(record);
                         }
 
-                        runningOutput.AddTimestamp(record.Timestamp);
-
-                        foreach (var dataColumn in runningOutput.Columns)
-                        {
-                            if (dataColumn.ProductId != null && section.ProductIndexWorkingData != null)
-                            {
-                                if (section.FactoredDefinitionsBySourceCodeByProduct.TryGetValue(dataColumn.ProductId, out var factoredDefinitionsForProduct) &&
-                                    factoredDefinitionsForProduct.TryGetValue(dataColumn.SrcName, out var factoredDefinition))
-                                {
-                                    NumericRepresentationValue value = record.GetMeterValue(factoredDefinition.WorkingData) as NumericRepresentationValue;
-                                    var doubleVal = value.AsConvertedDouble(dataColumn.TargetUOMCode) * factoredDefinition.Factor;
-
-                                    NumericRepresentationValue productValue = record.GetMeterValue(section.ProductIndexWorkingData) as NumericRepresentationValue;
-                                    var productValueData = productValue?.Value?.Value;
-                                    if (productValueData != null && dataColumn.ProductId == ((int)productValueData).ToString())
-                                    {
-                                        dataColumn.Values.Add(doubleVal);
-                                    }
-                                    else
-                                    {
-                                        dataColumn.Values.Add(0d); //We're not applying this product to this section
-                                    }
-                                }
-                                else
-                                {
-                                    dataColumn.Values.Add(0d); //This section doesn't report this working data for this product (e.g. grouped operations, or not every section reports every column)
-                                }
-                            }
-                            else
-                            {
-                                if (section.FactoredDefinitionsBySourceCodeByProduct.TryGetValue(string.Empty, out var factoredDefinitionsForSection) &&
-                                    factoredDefinitionsForSection.TryGetValue(dataColumn.SrcName, out var factoredDefinition))
-                                {
-                                    NumericRepresentationValue value = record.GetMeterValue(factoredDefinition.WorkingData) as NumericRepresentationValue;
-                                    var doubleVal = value.AsConvertedDouble(dataColumn.TargetUOMCode) * factoredDefinition.Factor;
-                                    dataColumn.Values.Add(doubleVal);
-                                }
-                                else
-                                {
-                                    dataColumn.Values.Add(null); //This section doesn't report this working data; missing is not zero
-                                }
-                            }
-                        }
+                        writer.AddRow(record.Timestamp, values, wkb, bounds.MinX, bounds.MinY, bounds.MaxX, bounds.MaxY);
                     }
                     else
                     {
                         section.ClearLeadingEdge();
                     }
                 }
+
                 priorSpatialRecord = record;
             }
         }
@@ -601,6 +670,8 @@ namespace AgGateway.ADAPT.StandardPlugin
         internal OperationTypeEnum OperationType { get; set; }
         internal Dictionary<string, VariableElement> VariablesByOutputName { get; set; }
         internal ADAPTParquetColumnData ColumnData { get; set; }
+        internal string OperationReferenceId { get; set; }
+        internal string SpatialRecordsFile { get; set; }
         internal string Key()
         {
             return string.Join(";", SourceOperations.Select(x => x.OperationData.Id.ReferenceId.ToString()));

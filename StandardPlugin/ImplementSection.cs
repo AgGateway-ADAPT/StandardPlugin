@@ -6,7 +6,6 @@ using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.ApplicationDataModel.Equipment;
 using AgGateway.ADAPT.ApplicationDataModel.LoggedData;
 using AgGateway.ADAPT.ApplicationDataModel.Representations;
-using NetTopologySuite.Geometries;
 
 namespace AgGateway.ADAPT.StandardPlugin
 {
@@ -154,126 +153,110 @@ namespace AgGateway.ADAPT.StandardPlugin
         }
 
         private LeadingEdge _latestLeadingEdge;
-        public bool TryGetCoveragePolygon(SpatialRecord record, SpatialRecord previousRecord, out Polygon polygon)
+        public bool TryGetCoverageWkb(
+            in CoverageRecordContext context,
+            double bearing,
+            double? reportedDistance,
+            double? calculatedDistance,
+            out byte[] wkb,
+            out CoverageBounds bounds)
         {
-            polygon = null;
-            var adaptPoint = (ApplicationDataModel.Shapes.Point)record.Geometry;
-            Point point = new Point(adaptPoint.X, adaptPoint.Y);
+            wkb = null;
+            bounds = default;
 
-            if (point.X == 0 && point.Y == 0)
-            {
-                return false;
-            }
+            double inlineOffset = Offset.X ?? 0d;
+            double lateralOffset = Offset.Y ?? 0d;
 
-            Point priorPoint = null;
-            if (previousRecord != null)
+            // The grid origin is the GPS fix. ADAPT X offset is inline (along the heading) and
+            // Y offset is lateral. Lateral is applied at heading + 90, which is to the right
+            // because headings are clockwise from north.
+            var leadingCenter = new LocalPoint(0d, 0d);
+            if (inlineOffset != 0d || lateralOffset != 0d)
             {
-                var priorADAPTPoint = (ApplicationDataModel.Shapes.Point)previousRecord.Geometry;
-                priorPoint = new Point(priorADAPTPoint.X, priorADAPTPoint.Y);
-            }
-
-            var sectionDefinitions = FactoredDefinitionsBySourceCodeByProduct[string.Empty];
-
-            double bearing = 0d;
-            if (sectionDefinitions.TryGetValue("vrHeading", out var headingDefinition))
-            {
-                var headingValue = ((NumericRepresentationValue)record.GetMeterValue(headingDefinition.WorkingData))?.Value?.Value;
-                if (headingValue != null)
-                {
-                    bearing = headingValue.Value;
-                }
-                else if (priorPoint != null)
-                {
-                    bearing = GeometryExporter.HaversineBearing(priorPoint, point);
-                }
-            }
-            else if (priorPoint != null)
-            {
-                bearing = GeometryExporter.HaversineBearing(priorPoint, point);
+                leadingCenter = context.Geodesy.DestinationLocal(leadingCenter, inlineOffset, bearing % 360d);
+                leadingCenter = context.Geodesy.DestinationLocal(leadingCenter, lateralOffset, bearing + 90d);
             }
 
-            var x = point.Destination(Offset.X ?? 0d, bearing % 360d);
-            var xy = x.Destination(Offset.Y ?? 0d, bearing + 90d % 360d);
-
-            double? reportedDistance = null;
-            if (sectionDefinitions.TryGetValue("vrDistanceTraveled", out var distanceDefinition) &&
-                record.GetMeterValue(distanceDefinition.WorkingData) is NumericRepresentationValue distanceData)
-            {
-                reportedDistance = distanceData?.Value?.Value;
-            }
-            double? calculatedDistance = null;
-            if (!(reportedDistance > 0d) && priorPoint != null)
-            {
-                calculatedDistance = GeometryExporter.HaversineDistance(priorPoint, point);
-            }
-            polygon = xy.AsCoveragePolygon(WidthM, ref _latestLeadingEdge, bearing, reportedDistance, calculatedDistance);
-            if (polygon.IsEmpty || !polygon.IsValid)
-            {
-                return false;
-            }
-            return true;
+            return CoveragePolygonWriter.TryWrite(
+                context.Geodesy,
+                leadingCenter,
+                WidthM,
+                ref _latestLeadingEdge,
+                bearing,
+                reportedDistance,
+                calculatedDistance,
+                out wkb,
+                out bounds);
         }
 
         public void ClearLeadingEdge()
         {
-            _latestLeadingEdge = null;
+            _latestLeadingEdge = default;
         }
+
     }
 
-    internal class LeadingEdge
+    internal struct LeadingEdge
     {
-        public LeadingEdge(Point leadingPoint, double width, LeadingEdge priorLeadingEdge, double heading)
-        {
-            Heading = heading;
-            double wh = width / 2d;
-            Left = leadingPoint.Destination(wh, Extensions.HeadingLeft(heading));
-            Center = leadingPoint;
-            Right = leadingPoint.Destination(wh, Extensions.HeadingRight(heading));
+        internal bool HasValue;
+        internal double LeftLon;
+        internal double LeftLat;
+        internal double CenterLon;
+        internal double CenterLat;
+        internal double RightLon;
+        internal double RightLat;
+        internal double Heading;
 
-            if (priorLeadingEdge != null && this.AsLineString().Intersects(priorLeadingEdge.AsLineString()))
+        internal LeadingEdge(LocalGeodesy geodesy, LocalPoint leadingCenter, double width, in LeadingEdge priorLeadingEdge, double heading)
+        {
+            HasValue = true;
+            Heading = heading;
+            // Half the section width to either side. Headings grow clockwise, so left is heading - 90 and right is heading + 90.
+            double wh = width / 2d;
+            var leftLocal = geodesy.DestinationLocal(leadingCenter, wh, Extensions.HeadingLeft(heading));
+            var rightLocal = geodesy.DestinationLocal(leadingCenter, wh, Extensions.HeadingRight(heading));
+            geodesy.ToGeographic(leadingCenter.EastM, leadingCenter.NorthM, out CenterLon, out CenterLat);
+            geodesy.ToGeographic(leftLocal.EastM, leftLocal.NorthM, out LeftLon, out LeftLat);
+            geodesy.ToGeographic(rightLocal.EastM, rightLocal.NorthM, out RightLon, out RightLat);
+
+            if (priorLeadingEdge.HasValue)
             {
-                //Implement is turning significantly
-                bool turningLeft = priorLeadingEdge.Heading < heading;
-                if (Math.Abs(priorLeadingEdge.Heading - heading) > 300d)
+                var priorLeftLocal = geodesy.ToLocalPoint(priorLeadingEdge.LeftLon, priorLeadingEdge.LeftLat);
+                var priorRightLocal = geodesy.ToLocalPoint(priorLeadingEdge.RightLon, priorLeadingEdge.RightLat);
+                // The new leading edge crossed the previous one, which happens when the implement
+                // turns tighter than the section is wide. Pin the inside corner to the previous
+                // inside corner so the quad does not bow-tie. Heading delta is wrapped into -180..180
+                // first: 350 to 10 is +20, a right turn, and 10 to 350 is -20, a left turn.
+                if (LocalGeodesy.SegmentsIntersect(leftLocal, rightLocal, priorLeftLocal, priorRightLocal))
                 {
-                    //Bearings are on either side of zero
-                    if (priorLeadingEdge.Heading - 360d > heading)
+                    bool turningLeft = WrapSignedDegrees(heading - priorLeadingEdge.Heading) < 0d;
+                    if (turningLeft)
                     {
-                        turningLeft = false;
+                        LeftLon = priorLeadingEdge.LeftLon;
+                        LeftLat = priorLeadingEdge.LeftLat;
                     }
-                    else if (priorLeadingEdge.Heading - 360d < heading)
+                    else
                     {
-                        turningLeft = true;
+                        RightLon = priorLeadingEdge.RightLon;
+                        RightLat = priorLeadingEdge.RightLat;
                     }
-                }
-                if (turningLeft)
-                {
-                    Left = priorLeadingEdge.Left;
-                }
-                else
-                {
-                    Right = priorLeadingEdge.Right;
                 }
             }
         }
 
-        public Point Left { get; set; }
-        public Point Center { get; set; }
-        public Point Right { get; set; }    
-        public double Heading { get; set; }
+        private static double WrapSignedDegrees(double delta)
+        {
+            delta %= 360d;
+            if (delta > 180d)
+            {
+                delta -= 360d;
+            }
+            else if (delta < -180d)
+            {
+                delta += 360d;
+            }
 
-        public double GetBearing(Point nextPoint)
-        {
-            return GeometryExporter.HaversineBearing(Center, nextPoint);
-        }
-        public double GetDistance(Point nextPoint)
-        {
-            return GeometryExporter.HaversineDistance(Center, nextPoint);
-        }
-
-        public LineString AsLineString()
-        {
-            return new LineString(new Coordinate[]{Left.AsCoordinate(), Right.AsCoordinate()});
+            return delta;
         }
     }
 

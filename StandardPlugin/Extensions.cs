@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using AgGateway.ADAPT.ApplicationDataModel.Equipment;
@@ -14,6 +15,12 @@ namespace AgGateway.ADAPT.StandardPlugin
 {
     internal static class Extensions
     {
+        // Convert has no instance state, so one converter is shared. The affine cache calls it twice per unit pair.
+        private static readonly RepresentationUnitSystem.UnitOfMeasureConverter SharedUnitConverter = new RepresentationUnitSystem.UnitOfMeasureConverter();
+        // MD5.Create allocates, and a shared hasher is not safe across the operation threads.
+        [ThreadStatic]
+        private static MD5 _md5Hasher;
+
         private class UnitCodeRemap
         {
             public string SourceUnitCode;
@@ -62,7 +69,19 @@ namespace AgGateway.ADAPT.StandardPlugin
                         .Select(g => g.Select(x => x.item));
         }
 
+        // Dimension lookup is expensive in the framework and invariant per unit pair; called per spatial value.
+        private static readonly ConcurrentDictionary<(string Source, string Target), bool> CanConvertCache = new ConcurrentDictionary<(string, string), bool>();
+
+        // Composite conversion repeats that dimension walk and allocates a unit on every call.
+        // The result is an affine scale and offset, so it can be resolved once per unit pair.
+        private static readonly ConcurrentDictionary<(string Source, string Target), ValueConverter> ValueConverterCache = new ConcurrentDictionary<(string, string), ValueConverter>();
+
         public static bool CanConvert(string srcUnitCode, string targetUnitCode)
+        {
+            return CanConvertCache.GetOrAdd((srcUnitCode, targetUnitCode), key => ComputeCanConvert(key.Source, key.Target));
+        }
+
+        private static bool ComputeCanConvert(string srcUnitCode, string targetUnitCode)
         {
             if (RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[targetUnitCode] != null &&
                 RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[srcUnitCode] != null)
@@ -104,6 +123,28 @@ namespace AgGateway.ADAPT.StandardPlugin
             return true;
         }
 
+        internal static bool TryGetRemappedUnitCodes(string representationCode, string srcUnitCode, string targetUnitCode, out string remappedSource, out string remappedTarget)
+        {
+            remappedSource = srcUnitCode;
+            remappedTarget = targetUnitCode;
+            if (UnitOfMeasureMapping.TryGetValue(representationCode, out var unitCodeRemap))
+            {
+                if (!string.IsNullOrEmpty(unitCodeRemap.NewSourceUnitCode) && unitCodeRemap.SourceUnitCode == srcUnitCode)
+                {
+                    remappedSource = unitCodeRemap.NewSourceUnitCode;
+                }
+
+                if (!string.IsNullOrEmpty(unitCodeRemap.TargetUnitCode))
+                {
+                    remappedTarget = unitCodeRemap.TargetUnitCode;
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
         public static double? AsConvertedDouble(this NumericRepresentationValue value, string targetUnitCode)
         {
             if (value == null)
@@ -118,17 +159,10 @@ namespace AgGateway.ADAPT.StandardPlugin
             var srcUnitCode = value.Value.UnitOfMeasure.Code;
             if (!value.Value.UnitOfMeasure.CanConvertInto(targetUnitCode))
             {
-                //First try to remap the unit codes
-                if (UnitOfMeasureMapping.TryGetValue(value.Representation.Code, out var unitCodeRemap))
+                if (TryGetRemappedUnitCodes(value.Representation.Code, srcUnitCode, targetUnitCode, out var remappedSource, out var remappedTarget))
                 {
-                    if (!string.IsNullOrEmpty(unitCodeRemap.NewSourceUnitCode) && unitCodeRemap.SourceUnitCode == srcUnitCode)
-                    {
-                        srcUnitCode = unitCodeRemap.NewSourceUnitCode;
-                    }
-                    if (!string.IsNullOrEmpty(unitCodeRemap.TargetUnitCode))
-                    {
-                        targetUnitCode = unitCodeRemap.TargetUnitCode;
-                    }
+                    srcUnitCode = remappedSource;
+                    targetUnitCode = remappedTarget;
                 }
                 else
                 {
@@ -142,15 +176,51 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         public static double ConvertValue(this double n, string srcUnitCode, string dstUnitCode)
         {
+            return GetValueConverter(srcUnitCode, dstUnitCode)(n);
+        }
+
+        internal delegate double ValueConverter(double value);
+
+        internal static ValueConverter BuildValueConverter(string representationCode, string srcUnitCode, string targetUnitCode)
+        {
+            // Remap only when the reported unit cannot convert to the standard unit.
+            // Seed rates reported as count per area already convert to count1ha-1; forcing seeds1ha-1 throws.
+            if (!CanConvert(srcUnitCode, targetUnitCode) &&
+                TryGetRemappedUnitCodes(representationCode, srcUnitCode, targetUnitCode, out var remappedSource, out var remappedTarget))
+            {
+                srcUnitCode = remappedSource;
+                targetUnitCode = remappedTarget;
+            }
+
+            return GetValueConverter(srcUnitCode, targetUnitCode);
+        }
+
+        private static ValueConverter GetValueConverter(string srcUnitCode, string dstUnitCode)
+        {
+            if (srcUnitCode == dstUnitCode)
+            {
+                return value => value;
+            }
+
+            return ValueConverterCache.GetOrAdd((srcUnitCode, dstUnitCode), key => CreateValueConverter(key.Source, key.Target));
+        }
+
+        private static ValueConverter CreateValueConverter(string srcUnitCode, string dstUnitCode)
+        {
             RepresentationUnitSystem.UnitOfMeasure sourceUOM = RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[srcUnitCode];
             RepresentationUnitSystem.UnitOfMeasure targetUOM = RepresentationUnitSystem.InternalUnitSystemManager.Instance.UnitOfMeasures[dstUnitCode];
             if (sourceUOM == null || targetUOM == null)
             {
-                return n; //Return the unconverted value
+                return value => value;
             }
 
-            RepresentationUnitSystem.UnitOfMeasureConverter converter = new RepresentationUnitSystem.UnitOfMeasureConverter();
-            return converter.Convert(sourceUOM, targetUOM, n);
+            // ADAPT units are a scale and an offset, so two conversions define every later value:
+            // converted = value * (Convert(1) - Convert(0)) + Convert(0). That matches Convert,
+            // including temperature offsets.
+            double convertedZero = SharedUnitConverter.Convert(sourceUOM, targetUOM, 0d);
+            double convertedOne = SharedUnitConverter.Convert(sourceUOM, targetUOM, 1d);
+            double scale = convertedOne - convertedZero;
+            return value => (value * scale) + convertedZero;
         }
 
         public static double WidthM(this DeviceElementConfiguration deviceElementConfiguration)
@@ -213,7 +283,7 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         public static Point Destination(this Point point, double distanceM, double headingDeg)
         {
-            return GeometryExporter.HaversineDestination(point, distanceM, headingDeg);
+            return GeometryExporter.Destination(point, distanceM, headingDeg);
         }
 
         public static Coordinate AsCoordinate(this Point point)
@@ -236,51 +306,11 @@ namespace AgGateway.ADAPT.StandardPlugin
             return heading + 90;
         }
 
-        public static Polygon AsCoveragePolygon(this Point leadingPoint, double width, ref LeadingEdge latestLeadingEdge, double heading, double? reportedDistance, double? calculatedDistance)
-        {
-            LeadingEdge priorLeadingEdge = latestLeadingEdge;
-            latestLeadingEdge = new LeadingEdge(leadingPoint, width, priorLeadingEdge, heading);
-            Point backRight;
-            Point backLeft;
-            if (priorLeadingEdge != null)
-            {
-                backRight = priorLeadingEdge.Right;
-                backLeft = priorLeadingEdge.Left;
-            }
-            else
-            {
-                //We only consider distance when we don't have a prior point to map from
-                double distance = 1; //1m as default without any other information (at start of data)
-                if (reportedDistance > 0d)
-                {
-                    distance = reportedDistance.Value;
-                }
-                else if (calculatedDistance > 0d)
-                {
-                    distance = calculatedDistance.Value;
-                }
-                //Clamp both ends: the floor keeps the back edge off the leading edge, which would make the polygon invalid
-                distance = Math.Clamp(distance, 0.1d, 4d);
-
-                backRight = latestLeadingEdge.Right.Destination(distance, HeadingBack(heading));
-                backLeft = backRight.Destination(width, HeadingLeft(heading));
-            }
-
-            List<Coordinate> ringCoordinates = new List<Coordinate>()
-            {
-                latestLeadingEdge.Left.AsCoordinate(),
-                latestLeadingEdge.Right.AsCoordinate(),
-                backRight.AsCoordinate(),
-                backLeft.AsCoordinate(),
-                latestLeadingEdge.Left.AsCoordinate()
-            };
-            LinearRing exterior = new LinearRing(ringCoordinates.ToArray());
-            return new Polygon(exterior);
-        }
         public static string AsMD5Hash(this string input)
         {
             var bytes = ASCIIEncoding.ASCII.GetBytes(input);
-            var hashBytes = MD5.Create().ComputeHash(bytes);
+            _md5Hasher ??= MD5.Create();
+            var hashBytes = _md5Hasher.ComputeHash(bytes);
             int i;
             StringBuilder sOutput = new StringBuilder(hashBytes.Length);
             for (i = 0; i < hashBytes.Length; i++)
