@@ -15,6 +15,13 @@ namespace AgGateway.ADAPT.StandardPlugin
 {
     internal class CommonExporters
     {
+        private static readonly object ConfigSyncRoot = new object();
+        private static List<TypeMapping> _cachedTypeMappings;
+        private static DataTypeDefinitions.DataTypeDefinitions _cachedStandardDataTypes;
+        // Seasons, errors, and custom data types are appended from parallel operations.
+        private readonly object _seasonSyncRoot = new object();
+        private readonly object _errorsSyncRoot = new object();
+        private readonly object _customDataTypeSyncRoot = new object();
         private readonly Standard.Catalog _catalog;
 
         public List<TypeMapping> TypeMappings { get; private set; }
@@ -26,16 +33,34 @@ namespace AgGateway.ADAPT.StandardPlugin
             _catalog = root.Catalog;
             Errors = new List<IError>();
 
-            var mappingFile = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "framework-to-standard-type-mappings.json");
-            string mappingData = File.ReadAllText(mappingFile);
-            TypeMappings = JsonConvert.DeserializeObject<List<TypeMapping>>(mappingData);
+            // The mapping files do not change during a process. Cache them so each export does not re-read and re-parse.
+            lock (ConfigSyncRoot)
+            {
+                if (_cachedTypeMappings == null || _cachedStandardDataTypes == null)
+                {
+                    var mappingFile = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "framework-to-standard-type-mappings.json");
+                    string mappingData = File.ReadAllText(mappingFile);
+                    _cachedTypeMappings = JsonConvert.DeserializeObject<List<TypeMapping>>(mappingData);
 
-            var standardTypesFile = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "adapt-data-type-definitions.json");
-            string typesJson = File.ReadAllText(standardTypesFile);
-            StandardDataTypes = JsonConvert.DeserializeObject<DataTypeDefinitions.DataTypeDefinitions>(typesJson);
+                    var standardTypesFile = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "adapt-data-type-definitions.json");
+                    string typesJson = File.ReadAllText(standardTypesFile);
+                    _cachedStandardDataTypes = JsonConvert.DeserializeObject<DataTypeDefinitions.DataTypeDefinitions>(typesJson);
+                }
+            }
+
+            TypeMappings = _cachedTypeMappings;
+            StandardDataTypes = _cachedStandardDataTypes;
         }
 
         public List<IError> Errors { get; }
+
+        internal void AddError(IError error)
+        {
+            lock (_errorsSyncRoot)
+            {
+                Errors.Add(error);
+            }
+        }
 
         public Id ExportID(CompoundIdentifier srcId)
         {
@@ -93,7 +118,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             {
                 if (frameworkTimeScope.DateContext == DateContextEnum.TimingEvent)
                 {
-                    Errors.Add(new Error
+                    AddError(new Error
                     {
                         Description = "Discarding TimingEvent TimeScope",
                         Id = frameworkTimeScope.Id.ReferenceId.ToString(CultureInfo.InvariantCulture),
@@ -127,23 +152,26 @@ namespace AgGateway.ADAPT.StandardPlugin
             var end = timeScope.TimeStamp2?.ToString("O", CultureInfo.InvariantCulture);
             var description = !timeScope.Description.IsNullOrEmpty() ? timeScope.Description : timeScope.TimeStamp1?.ToString("yyyy", CultureInfo.InvariantCulture) ?? string.Empty;
 
-            if (_catalog.Seasons == null)
+            lock (_seasonSyncRoot)
             {
-                _catalog.Seasons = new List<SeasonElement>();
-            }
-            var season = _catalog.Seasons.FirstOrDefault(x => x.Start == start && x.End == end && x.Description == description);
-            if (season == null)
-            {
-                season = new SeasonElement
+                if (_catalog.Seasons == null)
                 {
-                    Id = ExportID(timeScope.Id),
-                    Start = start,
-                    End = end,
-                    Description = description
-                };
-                _catalog.Seasons.Add(season);
+                    _catalog.Seasons = new List<SeasonElement>();
+                }
+                var season = _catalog.Seasons.FirstOrDefault(x => x.Start == start && x.End == end && x.Description == description);
+                if (season == null)
+                {
+                    season = new SeasonElement
+                    {
+                        Id = ExportID(timeScope.Id),
+                        Start = start,
+                        End = end,
+                        Description = description
+                    };
+                    _catalog.Seasons.Add(season);
+                }
+                return season;
             }
-            return season;
         }
 
         private TimeScopeElement ExportTimeScope(TimeScope frameworkTimeScope)
@@ -192,7 +220,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             }
             if (level > 2)
             {
-                Errors.Add(new Error
+                AddError(new Error
                 {
                     Description = "Discarding nested context items",
                 });
@@ -235,7 +263,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             }
             if (role.Representation.Code != "dtPersonRole")
             {
-                Errors.Add(new Error
+                AddError(new Error
                 {
                     Description = $"Found unsupported Role - {role.Representation.Code}",
                 });
@@ -497,19 +525,22 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         private void TryAddCustomDataType(string code, string valueUOM, string baseTypeCode, string statusCode)
         {
-            var existingCustomDataType = _catalog.CustomDataTypeDefinitions.FirstOrDefault(x => x.DefinitionCode == code);
-            if (existingCustomDataType != null)
+            lock (_customDataTypeSyncRoot)
             {
-                return;
-            }
+                var existingCustomDataType = _catalog.CustomDataTypeDefinitions.FirstOrDefault(x => x.DefinitionCode == code);
+                if (existingCustomDataType != null)
+                {
+                    return;
+                }
 
-            _catalog.CustomDataTypeDefinitions.Add(new CustomDataTypeDefinitionElement
-            {
-                DefinitionCode = code,
-                Name = $"{code} ({valueUOM})",
-                DataDefinitionBaseTypeCode = baseTypeCode,
-                DataDefinitionStatusCode = statusCode,
-            });
+                _catalog.CustomDataTypeDefinitions.Add(new CustomDataTypeDefinitionElement
+                {
+                    DefinitionCode = code,
+                    Name = $"{code} ({valueUOM})",
+                    DataDefinitionBaseTypeCode = baseTypeCode,
+                    DataDefinitionStatusCode = statusCode,
+                });
+            }
         }
 
         private Standard.GuidanceShift ExportGuidanceShift(ApplicationDataModel.Guidance.GuidanceShift guidanceShift, ApplicationDataModel.ADM.Catalog catalog)

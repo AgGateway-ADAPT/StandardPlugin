@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Text;
 using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.Standard;
+using Newtonsoft.Json;
 
 namespace AgGateway.ADAPT.StandardPlugin
 {
@@ -55,11 +56,23 @@ namespace AgGateway.ADAPT.StandardPlugin
             errors.AddRange(catalogErrors);
             errors.AddRange(workOrderErrors);
             errors.AddRange(workRecordErrors);
-            var json = Serialize.ToJson(root);
 
             Directory.CreateDirectory(exportPath);
             var outputFileName = Path.Combine(exportPath, "adapt.json");
-            File.WriteAllText(outputFileName, json, Encoding.UTF8);
+            WriteAdaptJson(root, outputFileName, properties);
+        }
+
+        private static void WriteAdaptJson(Root root, string outputFileName, Properties properties)
+        {
+            // CompactJson writes the same object graph with Formatting.None. Omitted stays indented.
+            var settings = AgGateway.ADAPT.Standard.Converter.CreateSettings(ExportSettings.UseCompactJson(properties));
+            using (var streamWriter = new StreamWriter(outputFileName, false, Encoding.UTF8))
+            using (var jsonWriter = new JsonTextWriter(streamWriter))
+            {
+                jsonWriter.Formatting = settings.Formatting;
+                var serializer = JsonSerializer.Create(settings);
+                serializer.Serialize(jsonWriter, root);
+            }
         }
 
 

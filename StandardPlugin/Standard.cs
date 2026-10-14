@@ -2192,15 +2192,21 @@ namespace AgGateway.ADAPT.Standard
 
     internal static class Converter
     {
-        public static readonly JsonSerializerSettings Settings = new JsonSerializerSettings
+        public static readonly JsonSerializerSettings Settings = CreateSettings(compactJson: false);
+
+        // Compact output changes whitespace only. Dates stay ISO-8601 assumed universal.
+        internal static JsonSerializerSettings CreateSettings(bool compactJson)
         {
-            MetadataPropertyHandling = MetadataPropertyHandling.Ignore,
-            DateParseHandling = DateParseHandling.None,
-            Formatting = Formatting.Indented,
-            Converters =
+            return new JsonSerializerSettings
             {
-                new IsoDateTimeConverter { DateTimeStyles = DateTimeStyles.AssumeUniversal }
-            },
-        };
+                MetadataPropertyHandling = MetadataPropertyHandling.Ignore,
+                DateParseHandling = DateParseHandling.None,
+                Formatting = compactJson ? Formatting.None : Formatting.Indented,
+                Converters =
+                {
+                    new IsoDateTimeConverter { DateTimeStyles = DateTimeStyles.AssumeUniversal }
+                },
+            };
+        }
     }
 }
