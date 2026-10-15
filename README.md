@@ -38,6 +38,18 @@ _DeviceElementHierarchy_
 _Machine0Implement1Section2_
 - Climate
 
+### Multithread
+Spatial export can process operations concurrently. Some source plugins mutate shared state while `GetSpatialRecords()` is read, and concurrent export then fails. Set `Multithread` to `false` for those plugins and `true` only after that plugin has exported cleanly with more than one operation. When `Multithread` is omitted or `false`, operations are exported one at a time and each field's spatial data is released before the next field starts. When `true`, `ParallelThreadCount` sets how many operations run at once.
+
+## Optional Export Properties
+These are not required to interpret a source plugin. Omitted values keep the previous export behavior.
+
+### ParallelThreadCount
+Used only when `Multithread` is `true`. A positive integer sets how many operations or prescriptions export at once. When omitted, the count is the number of processors. `0` or a negative value exports one at a time through the concurrent path. This property is ignored when `Multithread` is `false`.
+
+### CompactJson
+`false` or omitted writes indented `adapt.json`. `true` writes the same document without indentation.
+
 # Data Mappings
 ADAPT Standard Version 2.0 released in June 2025.   The plugin converts to ADAPT Standard Version 2.0 and intends only to convert to the latest version of the specification at any time. 
 

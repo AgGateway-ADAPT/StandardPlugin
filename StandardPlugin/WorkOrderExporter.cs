@@ -1,8 +1,11 @@
 ﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.ApplicationDataModel.Documents;
 using AgGateway.ADAPT.ApplicationDataModel.Logistics;
@@ -18,12 +21,17 @@ namespace AgGateway.ADAPT.StandardPlugin
         private readonly string _exportPath;
         private readonly Standard.Documents _documents;
         private readonly CommonExporters _commonExporters;
+        private readonly bool _multithread;
+        private readonly int _maxParallelism;
+        private static readonly object _tiffSyncRoot = new object();
         private Tiff.TiffExtendProc _parentTagExtender;
 
-        private WorkOrderExporter(Root root, string exportPath)
+        private WorkOrderExporter(Root root, string exportPath, Properties properties)
         {
             _exportPath = exportPath;
             _documents = root.Documents;
+            _multithread = ExportSettings.UseMultithread(properties);
+            _maxParallelism = ExportSettings.GetMaxParallelism(properties);
 
             _documents.WorkOrders = new List<WorkOrderElement>();
 
@@ -32,8 +40,92 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         internal static IEnumerable<IError> Export(ApplicationDataModel.ADM.ApplicationDataModel dataModel, Root root, string exportPath, Properties properties = null)
         {
-            var exporter = new WorkOrderExporter(root, exportPath);
+            var exporter = new WorkOrderExporter(root, exportPath, properties);
             return exporter.Export(dataModel);
+        }
+
+        private sealed class PrescriptionExportResult
+        {
+            internal IEnumerable<VariableElement> Variables { get; set; }
+            internal string SpatialFile { get; set; }
+            internal List<SummaryValueElement> SummaryValues { get; set; }
+            internal List<IError> Errors { get; set; }
+        }
+
+        private PrescriptionExportResult[] ExportPrescriptionsInParallel(IReadOnlyList<(WorkItem WorkItem, WorkItemOperation WorkItemOperation, Prescription Prescription)> prescriptions, ApplicationDataModel.ADM.Catalog catalog)
+        {
+            var results = new PrescriptionExportResult[prescriptions.Count];
+            var firstIndexByPrescriptionId = new Dictionary<int, int>();
+            var distinctIndexes = new List<int>();
+            for (int i = 0; i < prescriptions.Count; i++)
+            {
+                int prescriptionId = prescriptions[i].Prescription.Id.ReferenceId;
+                if (firstIndexByPrescriptionId.ContainsKey(prescriptionId))
+                {
+                    continue;
+                }
+
+                firstIndexByPrescriptionId.Add(prescriptionId, i);
+                distinctIndexes.Add(i);
+            }
+
+            // Repeated references to one prescription share one file. Distinct prescriptions
+            // export concurrently only when more than one remains.
+            if (!_multithread || distinctIndexes.Count <= 1)
+            {
+                for (int distinctIndex = 0; distinctIndex < distinctIndexes.Count; distinctIndex++)
+                {
+                    int sourceIndex = distinctIndexes[distinctIndex];
+                    results[sourceIndex] = ExportPrescriptionResult(prescriptions[sourceIndex].Prescription, catalog);
+                }
+            }
+            else
+            {
+                try
+                {
+                    Parallel.For(0, distinctIndexes.Count, new ParallelOptions { MaxDegreeOfParallelism = _maxParallelism }, distinctIndex =>
+                    {
+                        int sourceIndex = distinctIndexes[distinctIndex];
+                        results[sourceIndex] = ExportPrescriptionResult(prescriptions[sourceIndex].Prescription, catalog);
+                    });
+                }
+                catch (AggregateException aggregate) when (aggregate.InnerExceptions.Count == 1)
+                {
+                    ExceptionDispatchInfo.Capture(aggregate.InnerExceptions[0]).Throw();
+                }
+            }
+
+            for (int i = 0; i < prescriptions.Count; i++)
+            {
+                int firstIndex = firstIndexByPrescriptionId[prescriptions[i].Prescription.Id.ReferenceId];
+                if (i == firstIndex)
+                {
+                    continue;
+                }
+
+                PrescriptionExportResult exported = results[firstIndex];
+                results[i] = new PrescriptionExportResult
+                {
+                    Variables = exported.Variables,
+                    SpatialFile = exported.SpatialFile,
+                    SummaryValues = exported.SummaryValues,
+                    Errors = new List<IError>()
+                };
+            }
+
+            return results;
+        }
+
+        private PrescriptionExportResult ExportPrescriptionResult(Prescription prescription, ApplicationDataModel.ADM.Catalog catalog)
+        {
+            (IEnumerable<VariableElement> variables, string spatialFile, List<SummaryValueElement> summaryValues, List<IError> errors) = ExportPrescription(prescription, catalog);
+            return new PrescriptionExportResult
+            {
+                Variables = variables,
+                SpatialFile = spatialFile,
+                SummaryValues = summaryValues,
+                Errors = errors
+            };
         }
 
         private IEnumerable<IError> Export(ApplicationDataModel.ADM.ApplicationDataModel dataModel)
@@ -193,10 +285,13 @@ namespace AgGateway.ADAPT.StandardPlugin
                             Name = string.Concat(field.Description, ": Work Order"),
                             Operations = new List<OperationElement>()
                         };
-                        foreach ((var workItem, var workItemOperation, var rx) in flatByField[key])
+                        var prescriptions = flatByField[key];
+                        var prescriptionResults = ExportPrescriptionsInParallel(prescriptions, dataModel.Catalog);
+                        for (int prescriptionIndex = 0; prescriptionIndex < prescriptions.Count; prescriptionIndex++)
                         {
-                            (IEnumerable<VariableElement> variables, string spatialFile, List<SummaryValueElement> summaryValues, List<IError> errors) = ExportPrescription(rx, dataModel.Catalog);
-                            outErrors.AddRange(errors);
+                            var (workItem, workItemOperation, rx) = prescriptions[prescriptionIndex];
+                            var prescriptionResult = prescriptionResults[prescriptionIndex];
+                            outErrors.AddRange(prescriptionResult.Errors);
                             nonOrphanedRxs.Add(rx.Id.ReferenceId);
 
                             OperationElement operationElement = new OperationElement()
@@ -209,10 +304,10 @@ namespace AgGateway.ADAPT.StandardPlugin
                                 ReferenceLayerIds = workItem.ReferenceLayerIds.Select(x => x.ToString()).ToList(),
                                 PartyRoles = _commonExporters.ExportPersonRoles(rx.PersonRoles),
                                 ContextItems = _commonExporters.ExportContextItems(rx.ContextItems),
-                                Variables = variables.ToList(),
-                                ProductIds = variables.Select(x => x.ProductId).Distinct().ToList(),
-                                SpatialRecordsFile = spatialFile,
-                                SummaryValues = summaryValues,
+                                Variables = prescriptionResult.Variables.ToList(),
+                                ProductIds = prescriptionResult.Variables.Select(x => x.ProductId).Distinct().ToList(),
+                                SpatialRecordsFile = prescriptionResult.SpatialFile,
+                                SummaryValues = prescriptionResult.SummaryValues,
                             };
                             dstWorkOrder.Operations.Add(operationElement);
                         }
@@ -233,10 +328,13 @@ namespace AgGateway.ADAPT.StandardPlugin
                             Name = string.Concat(cropZone.Description, ": Work Order"),
                             Operations = new List<OperationElement>()
                         };
-                        foreach ((var workItem, var workItemOperation, var rx) in flatByCropZone[key])
+                        var prescriptions = flatByCropZone[key];
+                        var prescriptionResults = ExportPrescriptionsInParallel(prescriptions, dataModel.Catalog);
+                        for (int prescriptionIndex = 0; prescriptionIndex < prescriptions.Count; prescriptionIndex++)
                         {
-                            (IEnumerable<VariableElement> variables, string spatialFile, List<SummaryValueElement> summaryValues, List<IError> errors) = ExportPrescription(rx, dataModel.Catalog);
-                            outErrors.AddRange(errors);
+                            var (workItem, workItemOperation, rx) = prescriptions[prescriptionIndex];
+                            var prescriptionResult = prescriptionResults[prescriptionIndex];
+                            outErrors.AddRange(prescriptionResult.Errors);
                             nonOrphanedRxs.Add(rx.Id.ReferenceId);
 
                             OperationElement operationElement = new OperationElement()
@@ -249,10 +347,10 @@ namespace AgGateway.ADAPT.StandardPlugin
                                 ReferenceLayerIds = workItem.ReferenceLayerIds.Select(x => x.ToString()).ToList(),
                                 PartyRoles = _commonExporters.ExportPersonRoles(rx.PersonRoles),
                                 ContextItems = _commonExporters.ExportContextItems(rx.ContextItems),
-                                Variables = variables.ToList(),
-                                ProductIds = variables.Select(x => x.ProductId).Distinct().ToList(),
-                                SpatialRecordsFile = spatialFile,
-                                SummaryValues = summaryValues,
+                                Variables = prescriptionResult.Variables.ToList(),
+                                ProductIds = prescriptionResult.Variables.Select(x => x.ProductId).Distinct().ToList(),
+                                SpatialRecordsFile = prescriptionResult.SpatialFile,
+                                SummaryValues = prescriptionResult.SummaryValues,
                             };
                             dstWorkOrder.Operations.Add(operationElement);
                         }
@@ -447,7 +545,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                         exportColumns.Add(new WorkOrderExportColumn()
                         {
                             Variable = variable,
-                            ConversionFactor = 1d.ConvertValue(frameworkRxProductLookup.UnitOfMeasure.Code, targetUOMCode),
+                            ConversionFactor = 1d.ConvertValue(frameworkRxProductLookup.UnitOfMeasure.Code, targetUOMCode).Value,
                             ProductLookup = frameworkRxProductLookup,
                         });
                     }
@@ -491,37 +589,34 @@ namespace AgGateway.ADAPT.StandardPlugin
 
             ADAPTParquetColumnData columnData = new ADAPTParquetColumnData();
             columnData.AddVectorPrescription(srcRx, exportColumns, catalog, _commonExporters);
+            var values = new double?[columnData.Columns.Count];
 
-            foreach (var shapeLookup in srcRx.RxShapeLookups)
+            using (var writer = new ADAPTParquetWriter(columnData, includeTimestamps: false, openFile: () => outputPath, geometryType: "MultiPolygon"))
             {
-                var geometry = GeometryExporter.ExportMultiPolygon(shapeLookup.Shape);
-                if (columnData.BoundingBox == null)
+                foreach (var shapeLookup in srcRx.RxShapeLookups)
                 {
-                    columnData.BoundingBox = geometry.EnvelopeInternal;
-                }
-                else
-                {
-                    columnData.BoundingBox.ExpandToInclude(geometry.EnvelopeInternal);
-                }
-                
-                foreach (var dataColumn in columnData.Columns)
-                {                    
-                    var exportColumn = exportColumns.FirstOrDefault(x => x.Variable.GeoParquetColumnName == dataColumn.TargetName);
-                    if (exportColumn != null)
+                    var geometry = GeometryExporter.ExportMultiPolygon(shapeLookup.Shape);
+                    var envelope = geometry.EnvelopeInternal;
+                    for (int columnIndex = 0; columnIndex < columnData.Columns.Count; columnIndex++)
                     {
-                        var rate = shapeLookup.Rates.FirstOrDefault(x => x.RxProductLookupId == exportColumn.ProductLookup.Id.ReferenceId);
-                        dataColumn.Values.Add(rate.Rate * exportColumn.ConversionFactor);
+                        var dataColumn = columnData.Columns[columnIndex];
+                        var exportColumn = exportColumns.FirstOrDefault(x => x.Variable.GeoParquetColumnName == dataColumn.TargetName);
+                        if (exportColumn != null)
+                        {
+                            var rate = shapeLookup.Rates.FirstOrDefault(x => x.RxProductLookupId == exportColumn.ProductLookup.Id.ReferenceId);
+                            values[columnIndex] = rate.Rate * exportColumn.ConversionFactor;
+                        }
+                        else
+                        {
+                            values[columnIndex] = 0d;
+                        }
                     }
-                    else
-                    {
-                        dataColumn.Values.Add(0d);
-                    }
-                }
-                columnData.Geometries.Add(geometry.ToBinary());
-            }
 
-            ADAPTParquetWriter writer = new ADAPTParquetWriter(columnData);
-            writer.Write(outputPath);
+                    writer.AddRow(null, values, geometry.ToBinary(), envelope.MinX, envelope.MinY, envelope.MaxX, envelope.MaxY);
+                }
+
+                writer.Complete();
+            }
 
             return fileName;
         }
@@ -538,88 +633,101 @@ namespace AgGateway.ADAPT.StandardPlugin
                 return null;
             }
 
-            _parentTagExtender = Tiff.SetTagExtender(TagExtender);
-
             var fileName = $"{srcRx.Description ?? ""}{srcRx.Id.ReferenceId}.tiff";
             Directory.CreateDirectory(_exportPath);
             string outputPath = Path.Combine(_exportPath, fileName);
-            using (var tiff = Tiff.Open(outputPath, "w"))
+            // LibTiff's tag extender is process-global. The lock is static so two exports
+            // cannot replace it, and it is held across the write.
+            lock (_tiffSyncRoot)
             {
-                var productCount = srcRx.Rates.First().RxRates.Select(x => x.RxProductLookupId).Distinct().Count();
-                var min = srcRx.Rates.SelectMany(x => x.RxRates).Min(x => x.Rate);
-                var max = srcRx.Rates.SelectMany(x => x.RxRates).Max(x => x.Rate);
-
-                var columnCount = srcRx.ColumnCount;
-                var rowCount = srcRx.RowCount;
-                tiff.SetField(TiffTag.IMAGEWIDTH, columnCount);
-                tiff.SetField(TiffTag.IMAGELENGTH, rowCount);
-                tiff.SetField(TiffTag.SAMPLESPERPIXEL, productCount);
-                tiff.SetField(TiffTag.SAMPLEFORMAT, SampleFormat.IEEEFP);
-                tiff.SetField(TiffTag.BITSPERSAMPLE, 64);
-                tiff.SetField(TiffTag.PLANARCONFIG, PlanarConfig.CONTIG);
-                tiff.SetField(TiffTag.ROWSPERSTRIP, 1);
-                tiff.SetField(TiffTag.PHOTOMETRIC, Photometric.RGB);
-
-                tiff.SetField(TiffTag.COMPRESSION, Compression.DEFLATE);
-
-                // Rows are ordered bottom to top in RxPrescription but in GeoTIFF they are stored top to bottom.
-                // Set model tie point to north-west corner which corresponds to the last row in input data
-                // and reverse the order of cells later on.
-
-                // Model tie point specifies location of a point in raster space (first 3 numbers) in vector space (last 3 numbers)
-                var originX = srcRx.Origin.X;
-                var originY = srcRx.Origin.Y + srcRx.CellHeight.Value.Value;
-                double[] tiePoints = new double[] { 0, rowCount - 1, 0, originX, originY, 0 };
-                tiff.SetField(TiffTag.GEOTIFF_MODELTIEPOINTTAG, 6, tiePoints);
-
-                double[] pixelScale = new double[] { srcRx.CellWidth.Value.Value, srcRx.CellHeight.Value.Value, 0 };
-                tiff.SetField(TiffTag.GEOTIFF_MODELPIXELSCALETAG, 3, pixelScale);
-
-                // First line a header, defining version and how many values follows.
-                // Each next line consist of 4 fields: geo key, value location/type, how many values, actual value
-                short[] geoDir = new short[4 * 4]
+                _parentTagExtender = Tiff.SetTagExtender(TagExtender);
+                try
                 {
-                    // KeyDirectoryVersion (1), KeyRevision (1), MinorRevision (2), NumberOfKeys (3 - how many additional lines)
-                      1,    1,  2,  3 ,
-                    // GTModelTypeGeoKey (1024), TIFFTagLocation (0 - short), Count (1), ModelTypeGeographic (2 - Geographic latitude-longitude System)
-                    1024,   0,  1,  2 ,
-                    // GTRasterTypeGeoKey (1025), TIFFTagLocation (0 - short), Count (1), RasterPixelIsArea (1)
-                    1025,   0,  1,  1 ,
-                    // GeographicTypeGeoKey (2048), TIFFTagLocation (0 - short), Count (1), GCS_WGS_84 (4326)
-                    2048,   0,  1,  4326
-                };
-                tiff.SetField(TiffTag.GEOTIFF_GEOKEYDIRECTORYTAG, geoDir.Length, geoDir);
-
-                var rows = srcRx.Rates.Batch(columnCount).ToList();
-                rows.Reverse();
-                for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
-                {
-                    var cells = rows[rowIndex];
-                    //old - doesn't enforce any order of variables
-                    //var byteData = cells.SelectMany(x => x.RxRates).SelectMany(x => BitConverter.GetBytes(x.Rate)).ToArray();
-                    //new
-                    List<byte[]> bytes = new List<byte[]>();
-                    foreach (var cell in cells)
+                    using (var tiff = Tiff.Open(outputPath, "w"))
                     {
-                        foreach (var exportColumn in exportColumns)
+                        var productCount = exportColumns.Count;
+                        var columnCount = srcRx.ColumnCount;
+                        var rowCount = srcRx.RowCount;
+                        tiff.SetField(TiffTag.IMAGEWIDTH, columnCount);
+                        tiff.SetField(TiffTag.IMAGELENGTH, rowCount);
+                        tiff.SetField(TiffTag.SAMPLESPERPIXEL, productCount);
+                        tiff.SetField(TiffTag.SAMPLEFORMAT, SampleFormat.IEEEFP);
+                        tiff.SetField(TiffTag.BITSPERSAMPLE, 64);
+                        tiff.SetField(TiffTag.PLANARCONFIG, PlanarConfig.CONTIG);
+                        tiff.SetField(TiffTag.ROWSPERSTRIP, 1);
+                        tiff.SetField(TiffTag.PHOTOMETRIC, Photometric.RGB);
+
+                        tiff.SetField(TiffTag.COMPRESSION, Compression.DEFLATE);
+
+                        // Rows are ordered bottom to top in RxPrescription but in GeoTIFF they are stored top to bottom.
+                        // Set model tie point to north-west corner which corresponds to the last row in input data
+                        // and reverse the order of cells later on.
+
+                        // Model tie point specifies location of a point in raster space (first 3 numbers) in vector space (last 3 numbers)
+                        var originX = srcRx.Origin.X;
+                        var originY = srcRx.Origin.Y + srcRx.CellHeight.Value.Value;
+                        double[] tiePoints = new double[] { 0, rowCount - 1, 0, originX, originY, 0 };
+                        tiff.SetField(TiffTag.GEOTIFF_MODELTIEPOINTTAG, 6, tiePoints);
+
+                        double[] pixelScale = new double[] { srcRx.CellWidth.Value.Value, srcRx.CellHeight.Value.Value, 0 };
+                        tiff.SetField(TiffTag.GEOTIFF_MODELPIXELSCALETAG, 3, pixelScale);
+
+                        // First line a header, defining version and how many values follows.
+                        // Each next line consist of 4 fields: geo key, value location/type, how many values, actual value
+                        short[] geoDir = new short[4 * 4]
                         {
-                            var rxRate = cell.RxRates.FirstOrDefault(x => x.RxProductLookupId == exportColumn.ProductLookup.Id.ReferenceId);
-                            if (rxRate != null)
+                            // KeyDirectoryVersion (1), KeyRevision (1), MinorRevision (2), NumberOfKeys (3 - how many additional lines)
+                              1,    1,  2,  3 ,
+                            // GTModelTypeGeoKey (1024), TIFFTagLocation (0 - short), Count (1), ModelTypeGeographic (2 - Geographic latitude-longitude System)
+                            1024,   0,  1,  2 ,
+                            // GTRasterTypeGeoKey (1025), TIFFTagLocation (0 - short), Count (1), RasterPixelIsArea (1)
+                            1025,   0,  1,  1 ,
+                            // GeographicTypeGeoKey (2048), TIFFTagLocation (0 - short), Count (1), GCS_WGS_84 (4326)
+                            2048,   0,  1,  4326
+                        };
+                        tiff.SetField(TiffTag.GEOTIFF_GEOKEYDIRECTORYTAG, geoDir.Length, geoDir);
+
+                        int bytesPerRow = columnCount * productCount * sizeof(double);
+                        byte[] rowBuffer = new byte[Math.Max(bytesPerRow, 0)];
+                        if (columnCount > 0)
+                        {
+                            var sourceRowStarts = new List<int>();
+                            for (int sourceRowStart = 0; sourceRowStart < srcRx.Rates.Count; sourceRowStart += columnCount)
                             {
-                                bytes.Add(BitConverter.GetBytes(rxRate.Rate * exportColumn.ConversionFactor));
+                                sourceRowStarts.Add(sourceRowStart);
                             }
-                            else
+
+                            sourceRowStarts.Reverse();
+                            for (int rowIndex = 0; rowIndex < sourceRowStarts.Count; rowIndex++)
                             {
-                                bytes.Add(BitConverter.GetBytes(0d));
+                                int sourceRowStart = sourceRowStarts[rowIndex];
+                                int cellsInRow = Math.Min(columnCount, srcRx.Rates.Count - sourceRowStart);
+                                Span<byte> rowSpan = rowBuffer;
+                                int byteOffset = 0;
+                                for (int columnIndex = 0; columnIndex < cellsInRow; columnIndex++)
+                                {
+                                    var cell = srcRx.Rates[sourceRowStart + columnIndex];
+                                    foreach (var exportColumn in exportColumns)
+                                    {
+                                        var rxRate = cell.RxRates.FirstOrDefault(x => x.RxProductLookupId == exportColumn.ProductLookup.Id.ReferenceId);
+                                        double rate = rxRate != null ? rxRate.Rate * exportColumn.ConversionFactor : 0d;
+                                        BinaryPrimitives.WriteDoubleLittleEndian(rowSpan.Slice(byteOffset, sizeof(double)), rate);
+                                        byteOffset += sizeof(double);
+                                    }
+                                }
+
+                                tiff.WriteEncodedStrip(rowIndex, rowBuffer, byteOffset);
                             }
                         }
                     }
-                    var byteData = bytes.SelectMany(b => b).ToArray();
-                    tiff.WriteEncodedStrip(rowIndex, byteData, byteData.Length);
+                }
+                finally
+                {
+                    Tiff.SetTagExtender(_parentTagExtender);
+                    _parentTagExtender = null;
                 }
             }
 
-            Tiff.SetTagExtender(_parentTagExtender);
             return fileName;
         }
 
