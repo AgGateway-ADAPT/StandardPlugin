@@ -887,4 +887,37 @@ namespace StandardPluginTests
             }
         }
     }
+
+    public class SeasonExportTests
+    {
+        [Test]
+        public void SeasonWithoutANameUsesTheYear()
+        {
+            var exporters = new CommonExporters(new AgGateway.ADAPT.Standard.Root { Catalog = new AgGateway.ADAPT.Standard.Catalog() });
+            var season = exporters.GetOrAddSeason(new TimeScope
+            {
+                DateContext = DateContextEnum.CropSeason,
+                Description = "Spring planting",
+                TimeStamp1 = new DateTime(2022, 9, 1, 0, 0, 0, DateTimeKind.Utc),
+                TimeStamp2 = new DateTime(2023, 11, 1, 0, 0, 0, DateTimeKind.Utc)
+            });
+
+            Assert.That(season.Name, Is.EqualTo("2022"));
+            Assert.That(season.Description, Is.EqualTo("Spring planting"));
+        }
+
+        [Test]
+        public void SeasonWithoutADescriptionUsesTheYearForNameAndDescription()
+        {
+            var exporters = new CommonExporters(new AgGateway.ADAPT.Standard.Root { Catalog = new AgGateway.ADAPT.Standard.Catalog() });
+            var season = exporters.GetOrAddSeason(new TimeScope
+            {
+                DateContext = DateContextEnum.CropSeason,
+                TimeStamp2 = new DateTime(2015, 5, 2, 0, 0, 0, DateTimeKind.Utc)
+            });
+
+            Assert.That(season.Name, Is.EqualTo("2015"));
+            Assert.That(season.Description, Is.EqualTo("2015"));
+        }
+    }
 }

@@ -150,7 +150,10 @@ namespace AgGateway.ADAPT.StandardPlugin
         {
             var start = timeScope.TimeStamp1?.ToString("O", CultureInfo.InvariantCulture);
             var end = timeScope.TimeStamp2?.ToString("O", CultureInfo.InvariantCulture);
-            var description = !timeScope.Description.IsNullOrEmpty() ? timeScope.Description : timeScope.TimeStamp1?.ToString("yyyy", CultureInfo.InvariantCulture) ?? string.Empty;
+            var year = (timeScope.TimeStamp1 ?? timeScope.TimeStamp2)?.ToString("yyyy", CultureInfo.InvariantCulture);
+            var description = !timeScope.Description.IsNullOrEmpty() ? timeScope.Description : year ?? string.Empty;
+            // The schema requires a name. A crop season has no name of its own, so use the year.
+            var name = year ?? description;
 
             lock (_seasonSyncRoot)
             {
@@ -166,7 +169,8 @@ namespace AgGateway.ADAPT.StandardPlugin
                         Id = ExportID(timeScope.Id),
                         Start = start,
                         End = end,
-                        Description = description
+                        Description = description,
+                        Name = name
                     };
                     _catalog.Seasons.Add(season);
                 }
