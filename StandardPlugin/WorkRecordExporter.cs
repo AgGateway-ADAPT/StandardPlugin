@@ -9,6 +9,7 @@ using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.ApplicationDataModel.Common;
 using AgGateway.ADAPT.ApplicationDataModel.Documents;
 using AgGateway.ADAPT.ApplicationDataModel.LoggedData;
+using AgGateway.ADAPT.ApplicationDataModel.Products;
 using AgGateway.ADAPT.ApplicationDataModel.Representations;
 using AgGateway.ADAPT.Standard;
 
@@ -16,6 +17,8 @@ namespace AgGateway.ADAPT.StandardPlugin
 {
     internal class WorkRecordExporter
     {
+        // Same window as operation merging. Work records compare the gap between logged-data intervals.
+        internal const double ContemporaneousHours = 36d;
         private readonly SourceGeometryPosition _geometryPositition;
         private readonly SourceDeviceDefinition _deviceDefinition;
         private readonly CommonExporters _commonExporters;
@@ -82,10 +85,7 @@ namespace AgGateway.ADAPT.StandardPlugin
             for (int i = 0; i < fieldGroups.Count; i++)
             {
                 var fieldResult = ExportFieldGroup(fieldGroups[i].group, fieldGroups[i].index, model);
-                if (fieldResult.WorkRecord != null)
-                {
-                    _root.Documents.WorkRecords.Add(fieldResult.WorkRecord);
-                }
+                _root.Documents.WorkRecords.AddRange(fieldResult.WorkRecords);
 
                 errors.AddRange(fieldResult.Errors);
                 // Release this field after its operations have finished, including when they ran
@@ -105,23 +105,404 @@ namespace AgGateway.ADAPT.StandardPlugin
             return errors;
         }
 
+        private enum WorkRecordGroup
+        {
+            Application,
+            Harvest,
+            Tillage
+        }
+
+        private sealed class LoggedDataSlice
+        {
+            internal LoggedData LoggedData { get; set; }
+            internal List<OperationData> Operations { get; set; }
+            internal WorkRecordGroup Group { get; set; }
+            internal bool SplitFromLoggedData { get; set; }
+            internal int? CropId { get; set; }
+            internal bool HasCropConflict { get; set; }
+            internal DateTime? Start { get; set; }
+            internal DateTime? End { get; set; }
+        }
+
         private FieldExportResult ExportFieldGroup(IGrouping<int?, LoggedData> fieldIdGroupBy, int fieldIndex, ApplicationDataModel.ADM.ApplicationDataModel model)
         {
             FieldExportResult result = new FieldExportResult { FieldIndex = fieldIndex };
-            List<IError> errors = result.Errors;
-            List<OperationDefinition> groupedOperations = new List<OperationDefinition>();
-            foreach (var fieldLoggedData in fieldIdGroupBy)
+            foreach (var cluster in ClusterSlices(BuildSlices(fieldIdGroupBy, model.Catalog)))
             {
-                foreach (var operationData in GetMappableOperations(fieldLoggedData))
+                var workRecord = ExportCluster(cluster, model, result.Errors);
+                if (workRecord != null)
+                {
+                    result.WorkRecords.Add(workRecord);
+                }
+            }
+
+            result.LoggedDataToRelease.AddRange(fieldIdGroupBy);
+            return result;
+        }
+
+        // Harvest and tillage each get their own records so a following pass does not join them.
+        // Planting, fertilizing, and crop protection stay together when their intervals are close
+        // and they do not report two different crops.
+        private static WorkRecordGroup ClassifyOperation(OperationTypeEnum operationType)
+        {
+            switch (operationType)
+            {
+                case OperationTypeEnum.Harvesting:
+                case OperationTypeEnum.ForageHarvesting:
+                case OperationTypeEnum.Baling:
+                    return WorkRecordGroup.Harvest;
+                case OperationTypeEnum.Tillage:
+                    return WorkRecordGroup.Tillage;
+                default:
+                    return WorkRecordGroup.Application;
+            }
+        }
+
+        private List<LoggedDataSlice> BuildSlices(IEnumerable<LoggedData> loggedDataItems, ApplicationDataModel.ADM.Catalog catalog)
+        {
+            var slices = new List<LoggedDataSlice>();
+            foreach (var loggedData in loggedDataItems)
+            {
+                int? zoneCropId = CropFromZone(catalog, loggedData.CropZoneId);
+                bool loggedDataHasInterval = TryGetActualInterval(loggedData.TimeScopes, out DateTime loggedDataStart, out DateTime loggedDataEnd);
+                var pending = new List<LoggedDataSlice>();
+                foreach (var group in GetMappableOperations(loggedData).GroupBy(operation => ClassifyOperation(operation.OperationType)))
+                {
+                    var operationsByCrop = new Dictionary<int, List<OperationData>>();
+                    var operationsWithoutCrop = new List<OperationData>();
+                    foreach (var operation in group)
+                    {
+                        var cropIds = ReportedCropIds(operation, zoneCropId, catalog);
+                        if (cropIds.Count > 1)
+                        {
+                            pending.Add(CreateSlice(loggedData, group.Key, new List<OperationData> { operation }, null, true));
+                        }
+                        else if (cropIds.Count == 1)
+                        {
+                            int cropId = cropIds.First();
+                            if (!operationsByCrop.TryGetValue(cropId, out var operations))
+                            {
+                                operations = new List<OperationData>();
+                                operationsByCrop.Add(cropId, operations);
+                            }
+
+                            operations.Add(operation);
+                        }
+                        else
+                        {
+                            operationsWithoutCrop.Add(operation);
+                        }
+                    }
+
+                    foreach (var crop in operationsByCrop)
+                    {
+                        pending.Add(CreateSlice(loggedData, group.Key, crop.Value, crop.Key, false));
+                    }
+
+                    if (operationsWithoutCrop.Any())
+                    {
+                        pending.Add(CreateSlice(loggedData, group.Key, operationsWithoutCrop, null, false));
+                    }
+                }
+
+                foreach (var slice in pending)
+                {
+                    if (loggedDataHasInterval)
+                    {
+                        slice.Start = loggedDataStart;
+                        slice.End = loggedDataEnd;
+                    }
+                    else if (TryGetFirstSpatialInterval(slice.Operations, out DateTime operationStart, out DateTime operationEnd))
+                    {
+                        slice.Start = operationStart;
+                        slice.End = operationEnd;
+                    }
+                }
+
+                bool split = pending.Count > 1;
+                foreach (var slice in pending)
+                {
+                    slice.SplitFromLoggedData = split;
+                    slices.Add(slice);
+                }
+            }
+
+            return slices;
+        }
+
+        private static LoggedDataSlice CreateSlice(LoggedData loggedData, WorkRecordGroup group, List<OperationData> operations, int? cropId, bool hasCropConflict)
+        {
+            return new LoggedDataSlice
+            {
+                LoggedData = loggedData,
+                Operations = operations,
+                Group = group,
+                CropId = cropId,
+                HasCropConflict = hasCropConflict
+            };
+        }
+
+        // A crop zone and a variety or harvested-commodity product both report a crop.
+        // A fertilizer or other product with no crop does not.
+        private static List<int> ReportedCropIds(OperationData operation, int? zoneCropId, ApplicationDataModel.ADM.Catalog catalog)
+        {
+            var cropIds = new HashSet<int>();
+            if (zoneCropId.HasValue)
+            {
+                cropIds.Add(zoneCropId.Value);
+            }
+
+            if (operation.ProductIds != null && catalog?.Products != null)
+            {
+                foreach (var productId in operation.ProductIds)
+                {
+                    var product = catalog.Products.FirstOrDefault(candidate => candidate.Id.ReferenceId == productId);
+                    foreach (var cropId in ProductCropIds(product, catalog))
+                    {
+                        cropIds.Add(cropId);
+                    }
+                }
+            }
+
+            return cropIds.ToList();
+        }
+
+        private static IEnumerable<int> ProductCropIds(Product product, ApplicationDataModel.ADM.Catalog catalog)
+        {
+            switch (product)
+            {
+                case CropVarietyProduct variety:
+                    yield return variety.CropId;
+                    yield break;
+                case HarvestedCommodityProduct commodity:
+                    yield return commodity.CropId;
+                    yield break;
+                case null:
+                    yield break;
+            }
+
+            if (product.ProductComponents == null)
+            {
+                yield break;
+            }
+
+            foreach (var component in product.ProductComponents)
+            {
+                if (component == null || !component.IsProduct || catalog?.Products == null)
+                {
+                    continue;
+                }
+
+                var componentProduct = catalog.Products.FirstOrDefault(candidate => candidate.Id.ReferenceId == component.IngredientId);
+                switch (componentProduct)
+                {
+                    case CropVarietyProduct variety:
+                        yield return variety.CropId;
+                        break;
+                    case HarvestedCommodityProduct commodity:
+                        yield return commodity.CropId;
+                        break;
+                }
+            }
+        }
+
+        private static int? CropFromZone(ApplicationDataModel.ADM.Catalog catalog, int? cropZoneId)
+        {
+            if (!cropZoneId.HasValue || catalog?.CropZones == null)
+            {
+                return null;
+            }
+
+            return catalog.CropZones.FirstOrDefault(zone => zone.Id.ReferenceId == cropZoneId.Value)?.CropId;
+        }
+
+        // Without logged-data scopes, the first spatial point of each operation is the whole interval.
+        private static bool TryGetFirstSpatialInterval(IEnumerable<OperationData> operations, out DateTime start, out DateTime end)
+        {
+            start = DateTime.MaxValue;
+            end = DateTime.MinValue;
+            bool found = false;
+            foreach (var operation in operations)
+            {
+                if (TryGetFirstSpatialTimestamp(operation, out DateTime point))
+                {
+                    found = IncludeActualTimestamp(point, ref start, ref end) || found;
+                }
+            }
+
+            return found;
+        }
+
+        private static bool TryGetFirstSpatialTimestamp(OperationData operation, out DateTime timestamp)
+        {
+            timestamp = default;
+            var records = operation?.GetSpatialRecords?.Invoke();
+            if (records == null)
+            {
+                return false;
+            }
+
+            var first = records.Take(1).FirstOrDefault();
+            if (first == null)
+            {
+                return false;
+            }
+
+            timestamp = first.Timestamp;
+            return true;
+        }
+
+        private static bool TryGetActualInterval(IEnumerable<TimeScope> timeScopes, out DateTime start, out DateTime end)
+        {
+            start = DateTime.MaxValue;
+            end = DateTime.MinValue;
+            if (timeScopes == null)
+            {
+                return false;
+            }
+
+            bool found = false;
+            foreach (var timeScope in timeScopes)
+            {
+                if (timeScope == null ||
+                    (timeScope.DateContext != DateContextEnum.ActualStart && timeScope.DateContext != DateContextEnum.ActualEnd))
+                {
+                    continue;
+                }
+
+                if (timeScope.TimeStamp1.HasValue)
+                {
+                    found = IncludeActualTimestamp(timeScope.TimeStamp1.Value, ref start, ref end) || found;
+                }
+
+                if (timeScope.TimeStamp2.HasValue)
+                {
+                    found = IncludeActualTimestamp(timeScope.TimeStamp2.Value, ref start, ref end) || found;
+                }
+            }
+
+            return found;
+        }
+
+        private static bool IncludeActualTimestamp(DateTime timestamp, ref DateTime start, ref DateTime end)
+        {
+            if (timestamp < start)
+            {
+                start = timestamp;
+            }
+
+            if (timestamp > end)
+            {
+                end = timestamp;
+            }
+
+            return true;
+        }
+
+        private static List<List<LoggedDataSlice>> ClusterSlices(List<LoggedDataSlice> slices)
+        {
+            var clusters = new List<List<LoggedDataSlice>>();
+            foreach (var group in slices.GroupBy(slice => slice.Group))
+            {
+                clusters.AddRange(ClusterGroup(group.ToList()));
+            }
+
+            return clusters
+                .OrderBy(cluster => cluster.Select(slice => slice.Start).Min() ?? DateTime.MaxValue)
+                .ThenBy(cluster => cluster[0].Group)
+                .ThenBy(cluster => cluster.Select(slice => slice.CropId).FirstOrDefault(cropId => cropId.HasValue) ?? int.MaxValue)
+                .ToList();
+        }
+
+        private static List<List<LoggedDataSlice>> ClusterGroup(List<LoggedDataSlice> slices)
+        {
+            var clusters = new List<List<LoggedDataSlice>>();
+            var timed = slices.Where(slice => !slice.HasCropConflict && slice.Start.HasValue && slice.End.HasValue).ToList();
+            var cropClusters = new List<List<LoggedDataSlice>>();
+            foreach (var crop in timed.Where(slice => slice.CropId.HasValue).GroupBy(slice => slice.CropId.Value))
+            {
+                cropClusters.AddRange(ClusterByTime(crop.ToList()));
+            }
+
+            foreach (var freeCluster in ClusterByTime(timed.Where(slice => !slice.CropId.HasValue).ToList()))
+            {
+                var matches = cropClusters.Where(cropCluster => GapHours(freeCluster, cropCluster) < ContemporaneousHours).ToList();
+                if (matches.Count == 1)
+                {
+                    matches[0].AddRange(freeCluster);
+                }
+                else
+                {
+                    clusters.Add(freeCluster);
+                }
+            }
+
+            clusters.AddRange(cropClusters);
+            foreach (var slice in slices.Where(slice => slice.HasCropConflict || !slice.Start.HasValue || !slice.End.HasValue))
+            {
+                clusters.Add(new List<LoggedDataSlice> { slice });
+            }
+
+            return clusters;
+        }
+
+        private static List<List<LoggedDataSlice>> ClusterByTime(List<LoggedDataSlice> slices)
+        {
+            var clusters = new List<List<LoggedDataSlice>>();
+            List<LoggedDataSlice> current = null;
+            DateTime clusterEnd = default;
+            foreach (var slice in slices.OrderBy(slice => slice.Start.Value).ThenBy(slice => slice.LoggedData.Id.ReferenceId))
+            {
+                if (current == null || (slice.Start.Value - clusterEnd).TotalHours >= ContemporaneousHours)
+                {
+                    current = new List<LoggedDataSlice> { slice };
+                    clusters.Add(current);
+                    clusterEnd = slice.End.Value;
+                }
+                else
+                {
+                    current.Add(slice);
+                    if (slice.End.Value > clusterEnd)
+                    {
+                        clusterEnd = slice.End.Value;
+                    }
+                }
+            }
+
+            return clusters;
+        }
+
+        private static double GapHours(List<LoggedDataSlice> left, List<LoggedDataSlice> right)
+        {
+            DateTime leftStart = left.Min(slice => slice.Start.Value);
+            DateTime leftEnd = left.Max(slice => slice.End.Value);
+            DateTime rightStart = right.Min(slice => slice.Start.Value);
+            DateTime rightEnd = right.Max(slice => slice.End.Value);
+            if (leftStart <= rightEnd && rightStart <= leftEnd)
+            {
+                return 0d;
+            }
+
+            return rightStart > leftEnd
+                ? (rightStart - leftEnd).TotalHours
+                : (leftStart - rightEnd).TotalHours;
+        }
+
+        private WorkRecordElement ExportCluster(List<LoggedDataSlice> cluster, ApplicationDataModel.ADM.ApplicationDataModel model, List<IError> errors)
+        {
+            List<OperationDefinition> groupedOperations = new List<OperationDefinition>();
+            foreach (var slice in cluster)
+            {
+                foreach (var operationData in slice.Operations)
                 {
                     Implement implement = new Implement(operationData, model.Catalog, _geometryPositition, _deviceDefinition, _commonExporters.TypeMappings, errors);
 
-                    OperationDefinition operationDefinition = new OperationDefinition(implement, operationData, fieldLoggedData);
+                    OperationDefinition operationDefinition = new OperationDefinition(implement, operationData, slice.LoggedData);
                     var matchingOperation = groupedOperations.FirstOrDefault(x => x.IsMatchingOperation(operationDefinition));
                     if (matchingOperation != null)
                     {
                         matchingOperation.SourceOperations.Add(new ConstituentSpatialOperation(operationData, implement));
-                        matchingOperation.SourceLoggedDatas.Add(fieldLoggedData);
+                        matchingOperation.SourceLoggedDatas.Add(slice.LoggedData);
                     }
                     else
                     {
@@ -163,8 +544,9 @@ namespace AgGateway.ADAPT.StandardPlugin
                 }
             }
 
+            var loggedDatas = cluster.Select(slice => slice.LoggedData).Distinct().ToList();
             HashSet<Summary> sourceSummaries = new HashSet<Summary>();
-            foreach (var loggedData in fieldIdGroupBy)
+            foreach (var loggedData in loggedDatas)
             {
                 var summary = model.Documents.Summaries.FirstOrDefault(x => x.LoggedDataIds.Contains(loggedData.Id.ReferenceId) || x.Id.ReferenceId == loggedData.SummaryId);
                 if (summary != null)
@@ -211,79 +593,121 @@ namespace AgGateway.ADAPT.StandardPlugin
                 }
             }
 
-            if (groupedOperations.Any())
+            if (!groupedOperations.Any())
             {
-                var workRecordId = fieldIdGroupBy.Count() == 1 ? _commonExporters.ExportID(fieldIdGroupBy.First().Id) : new Id() { ReferenceId = string.Concat("field_", fieldIdGroupBy.First().FieldId?.ToString(), "_WorkRecord") };
-                var cropZoneId = fieldIdGroupBy.Count() == 1 ? fieldIdGroupBy.First().CropZoneId?.ToString(CultureInfo.InvariantCulture) : null;
-                var notes = fieldIdGroupBy.SelectMany(x => x.Notes).Any() ? fieldIdGroupBy.SelectMany(x => x.Notes).Select(y => y.Description).ToList() : null;
-                List<TimeScopeElement> timeScopeElements = new List<TimeScopeElement>();
-                string seasonId = null;
-                foreach (var loggedData in fieldIdGroupBy.ToList())
-                {
-                    var timeScopes = _commonExporters.ExportTimeScopes(loggedData.TimeScopes, out var seasonIds);
-                    if (timeScopes != null)
-                    {
-                        timeScopeElements.AddRange(timeScopes);
-                    }
-                    if (seasonIds.Any())
-                    {
-                        seasonId = seasonIds.First();
-                    }
-                }
-
-                var fieldWorkRecord = new WorkRecordElement
-                {
-                    Operations = new List<OperationElement>(),
-                    FieldId = groupedOperations.First().FieldId,
-                    Id = workRecordId,
-                    CropZoneId = cropZoneId,
-                    Name = string.Join("_", fieldIdGroupBy.ToList().Select(x => x.Description)),
-                    Notes = notes,
-                    TimeScopes = timeScopeElements.Any() ? timeScopeElements : null,
-                    SeasonId = seasonId
-                };
-
-                // Ids and file names are reserved in list order before any writer opens.
-                // Spatial export may then run concurrently. Operation elements, including total-N
-                // variable ids, are built afterward in that same order.
-                ReserveOperationOutputs(groupedOperations, model);
-                if (!_multithread || groupedOperations.Count <= 1)
-                {
-                    foreach (var operationDefinition in groupedOperations)
-                    {
-                        ExportOperationSpatialData(operationDefinition, model);
-                    }
-                }
-                else
-                {
-                    try
-                    {
-                        Parallel.For(0, groupedOperations.Count, new ParallelOptions { MaxDegreeOfParallelism = _maxParallelism }, operationIndex =>
-                        {
-                            ExportOperationSpatialData(groupedOperations[operationIndex], model);
-                        });
-                    }
-                    catch (AggregateException aggregate) when (aggregate.InnerExceptions.Count == 1)
-                    {
-                        ExceptionDispatchInfo.Capture(aggregate.InnerExceptions[0]).Throw();
-                    }
-                }
-
-                foreach (var operationDefinition in groupedOperations)
-                {
-                    if (operationDefinition.ColumnData.RowCount > 0 ||
-                        operationDefinition.SourceSummaryValuesByProductId.Any() ||
-                        operationDefinition.SourceSummaryValuesWithoutProduct.Any())
-                    {
-                        fieldWorkRecord.Operations.Add(ExportOperation(operationDefinition, model, fieldWorkRecord, errors));
-                    }
-                }
-
-                result.WorkRecord = fieldWorkRecord;
+                return null;
             }
 
-            result.LoggedDataToRelease.AddRange(fieldIdGroupBy);
-            return result;
+            var cropZoneIds = loggedDatas.Select(loggedData => loggedData.CropZoneId).Distinct().ToList();
+            var cropZoneId = cropZoneIds.Count == 1 && cropZoneIds[0].HasValue
+                ? cropZoneIds[0].Value.ToString(CultureInfo.InvariantCulture)
+                : null;
+            var notes = loggedDatas.SelectMany(loggedData => loggedData.Notes).Any()
+                ? loggedDatas.SelectMany(loggedData => loggedData.Notes).Select(note => note.Description).ToList()
+                : null;
+            List<TimeScopeElement> timeScopeElements = new List<TimeScopeElement>();
+            string seasonId = null;
+            foreach (var loggedData in loggedDatas)
+            {
+                var timeScopes = _commonExporters.ExportTimeScopes(loggedData.TimeScopes, out var seasonIds);
+                if (timeScopes != null)
+                {
+                    timeScopeElements.AddRange(timeScopes);
+                }
+                if (seasonIds.Any())
+                {
+                    seasonId = seasonIds.First();
+                }
+            }
+
+            var fieldWorkRecord = new WorkRecordElement
+            {
+                Operations = new List<OperationElement>(),
+                FieldId = groupedOperations.First().FieldId,
+                Id = CreateWorkRecordId(cluster, loggedDatas),
+                CropZoneId = cropZoneId,
+                Name = string.Join("_", loggedDatas.Select(loggedData => loggedData.Description)),
+                Notes = notes,
+                TimeScopes = timeScopeElements.Any() ? timeScopeElements : null,
+                SeasonId = seasonId
+            };
+
+            // Ids and file names are reserved in list order before any writer opens.
+            // Spatial export may then run concurrently. Operation elements, including total-N
+            // variable ids, are built afterward in that same order.
+            ReserveOperationOutputs(groupedOperations, model);
+            if (!_multithread || groupedOperations.Count <= 1)
+            {
+                foreach (var operationDefinition in groupedOperations)
+                {
+                    ExportOperationSpatialData(operationDefinition, model);
+                }
+            }
+            else
+            {
+                try
+                {
+                    Parallel.For(0, groupedOperations.Count, new ParallelOptions { MaxDegreeOfParallelism = _maxParallelism }, operationIndex =>
+                    {
+                        ExportOperationSpatialData(groupedOperations[operationIndex], model);
+                    });
+                }
+                catch (AggregateException aggregate) when (aggregate.InnerExceptions.Count == 1)
+                {
+                    ExceptionDispatchInfo.Capture(aggregate.InnerExceptions[0]).Throw();
+                }
+            }
+
+            foreach (var operationDefinition in groupedOperations)
+            {
+                if (operationDefinition.ColumnData.RowCount > 0 ||
+                    operationDefinition.SourceSummaryValuesByProductId.Any() ||
+                    operationDefinition.SourceSummaryValuesWithoutProduct.Any())
+                {
+                    fieldWorkRecord.Operations.Add(ExportOperation(operationDefinition, model, fieldWorkRecord, errors));
+                }
+            }
+
+            return fieldWorkRecord;
+        }
+
+        private Id CreateWorkRecordId(List<LoggedDataSlice> cluster, List<LoggedData> loggedDatas)
+        {
+            if (loggedDatas.Count == 1 && !cluster[0].SplitFromLoggedData)
+            {
+                return _commonExporters.ExportID(loggedDatas[0].Id);
+            }
+
+            string fieldId = loggedDatas[0].FieldId?.ToString(CultureInfo.InvariantCulture) ?? CatalogExporter.UnknownFieldId;
+            DateTime? clusterStart = null;
+            foreach (var slice in cluster)
+            {
+                if (slice.Start.HasValue && (clusterStart == null || slice.Start.Value < clusterStart.Value))
+                {
+                    clusterStart = slice.Start;
+                }
+            }
+
+            string startToken = clusterStart.HasValue
+                ? clusterStart.Value.ToString("yyyyMMdd'T'HHmmss", CultureInfo.InvariantCulture)
+                : "unscoped";
+            return new Id
+            {
+                ReferenceId = string.Concat("field_", fieldId, "_", cluster[0].Group.ToString(), "_", startToken, "_", CropToken(cluster), "_WorkRecord")
+            };
+        }
+
+        private static string CropToken(List<LoggedDataSlice> cluster)
+        {
+            if (cluster.Any(slice => slice.HasCropConflict))
+            {
+                return string.Concat("mixed_", cluster[0].Operations[0].Id.ReferenceId.ToString(CultureInfo.InvariantCulture));
+            }
+
+            var cropIds = cluster.Select(slice => slice.CropId).Where(cropId => cropId.HasValue).Select(cropId => cropId.Value).Distinct().ToList();
+            return cropIds.Count == 1
+                ? cropIds[0].ToString(CultureInfo.InvariantCulture)
+                : "none";
         }
 
 
@@ -714,7 +1138,7 @@ namespace AgGateway.ADAPT.StandardPlugin
 
         private bool DatesAreSimilar(DateTime first, DateTime second)
         {
-            return Math.Abs((first - second).TotalHours) < 36d;
+            return Math.Abs((first - second).TotalHours) < WorkRecordExporter.ContemporaneousHours;
         }
     }
 
