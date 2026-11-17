@@ -186,6 +186,45 @@ namespace StandardPluginTests
         }
 
         [Test]
+        public void CatalogOnlyExportOmitsDocuments()
+        {
+            var adm = new ApplicationDataModel
+            {
+                Catalog = new Catalog(),
+                Documents = new Documents()
+            };
+            var folder = CreateCleanFolder("catalog-only");
+            new Plugin().Export(adm, folder);
+
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                Assert.That(document.RootElement.TryGetProperty("documents", out _), Is.False);
+                Assert.That(document.RootElement.TryGetProperty("catalog", out _), Is.True);
+            }
+        }
+
+        [Test]
+        public void WorkRecordWithNoWrittenOperationsIsOmitted()
+        {
+            var adm = WorkRecordTestData.CreateStraightPassApplicationDataModel(recordCount: 2);
+            var operation = ((List<OperationData>)((List<LoggedData>)adm.Documents.LoggedData)[0].OperationData)[0];
+            foreach (var record in operation.GetSpatialRecords())
+            {
+                record.Geometry = null;
+            }
+
+            var folder = CreateCleanFolder("workrecord-no-operations");
+            ExportModel(adm, folder);
+
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                Assert.That(document.RootElement.TryGetProperty("documents", out _), Is.False);
+            }
+
+            Assert.That(Directory.GetFiles(folder, "*.parquet"), Is.Empty);
+        }
+
+        [Test]
         public void StraightPassExportProducesDeterministicParquet()
         {
             var adm = WorkRecordTestData.CreateStraightPassApplicationDataModel();

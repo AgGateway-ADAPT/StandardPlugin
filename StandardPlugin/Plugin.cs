@@ -57,9 +57,28 @@ namespace AgGateway.ADAPT.StandardPlugin
             errors.AddRange(workOrderErrors);
             errors.AddRange(workRecordErrors);
 
+            if (DocumentsAreEmpty(root.Documents))
+            {
+                root.Documents = null;
+            }
+
             Directory.CreateDirectory(exportPath);
             var outputFileName = Path.Combine(exportPath, "adapt.json");
             WriteAdaptJson(root, outputFileName, properties);
+        }
+
+        private static bool DocumentsAreEmpty(Standard.Documents documents)
+        {
+            if (documents == null)
+            {
+                return true;
+            }
+
+            return documents.Plans.IsNullOrEmpty()
+                && documents.Recommendations.IsNullOrEmpty()
+                && documents.ReferenceLayers.IsNullOrEmpty()
+                && documents.WorkOrders.IsNullOrEmpty()
+                && documents.WorkRecords.IsNullOrEmpty();
         }
 
         private static void WriteAdaptJson(Root root, string outputFileName, Properties properties)

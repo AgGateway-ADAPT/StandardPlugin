@@ -668,6 +668,13 @@ namespace AgGateway.ADAPT.StandardPlugin
                 }
             }
 
+            // The schema requires at least one operation. Spatial data that produced no rows
+            // and no summary leaves nothing to write.
+            if (!fieldWorkRecord.Operations.Any())
+            {
+                return null;
+            }
+
             return fieldWorkRecord;
         }
 
