@@ -7,6 +7,7 @@ using System.Threading;
 using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.ApplicationDataModel.Common;
 using AgGateway.ADAPT.ApplicationDataModel.Documents;
+using AgGateway.ADAPT.ApplicationDataModel.Guidance;
 using AgGateway.ADAPT.ApplicationDataModel.LoggedData;
 using AgGateway.ADAPT.ApplicationDataModel.Representations;
 using AgGateway.ADAPT.StandardPlugin;
@@ -200,6 +201,41 @@ namespace StandardPluginTests
             {
                 Assert.That(document.RootElement.TryGetProperty("documents", out _), Is.False);
                 Assert.That(document.RootElement.TryGetProperty("catalog", out _), Is.True);
+            }
+        }
+
+        [Test]
+        public void GuidanceWithoutANameUsesAFixedLabel()
+        {
+            var adm = new ApplicationDataModel
+            {
+                Catalog = new Catalog
+                {
+                    GuidanceGroups = new List<GuidanceGroup>
+                    {
+                        new GuidanceGroup { Description = "Headland", GuidancePatternIds = new List<int> { 1 } },
+                        new GuidanceGroup { GuidancePatternIds = new List<int> { 2 } }
+                    },
+                    GuidancePatterns = new List<GuidancePattern>
+                    {
+                        new AbLine { Description = "AB0" },
+                        new AbLine()
+                    }
+                },
+                Documents = new Documents()
+            };
+            var folder = CreateCleanFolder("guidance-group-name");
+            new Plugin().Export(adm, folder);
+
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                var catalog = document.RootElement.GetProperty("catalog");
+                var groups = catalog.GetProperty("guidanceGroups");
+                Assert.That(groups[0].GetProperty("name").GetString(), Is.EqualTo("Headland"));
+                Assert.That(groups[1].GetProperty("name").GetString(), Is.EqualTo("Unnamed Guidance Group"));
+                var patterns = catalog.GetProperty("guidancePatterns");
+                Assert.That(patterns[0].GetProperty("name").GetString(), Is.EqualTo("AB0"));
+                Assert.That(patterns[1].GetProperty("name").GetString(), Is.EqualTo("Unnamed Guidance Pattern"));
             }
         }
 
