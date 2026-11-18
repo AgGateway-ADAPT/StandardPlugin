@@ -355,7 +355,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                 GuidancePatternElement guidancePattern = new GuidancePatternElement()
                 {
                     Id = _commonExporters.ExportID(frameworkGuidancePattern.Id),
-                    Name = frameworkGuidancePattern.Description,
+                    Name = string.IsNullOrEmpty(frameworkGuidancePattern.Description) ? "Unnamed Guidance Pattern" : frameworkGuidancePattern.Description,
                     GuidancePatternTypeCode = ExportGuidancePatternType(frameworkGuidancePattern.GuidancePatternType),
                     GuidancePatternPropagationDirectionCode = ExportPropagationDirection(frameworkGuidancePattern.PropagationDirection),
                     GuidancePatternExtensionCode = ExportGuidanceExtension(frameworkGuidancePattern.Extension),
@@ -494,7 +494,7 @@ namespace AgGateway.ADAPT.StandardPlugin
                 GuidanceGroupElement guidanceGroup = new GuidanceGroupElement()
                 {
                     Id = _commonExporters.ExportID(frameworkGuidanceGroup.Id),
-                    Name = frameworkGuidanceGroup.Description,
+                    Name = string.IsNullOrEmpty(frameworkGuidanceGroup.Description) ? "Unnamed Guidance Group" : frameworkGuidanceGroup.Description,
                     GuidancePatternIds = frameworkGuidanceGroup.GuidancePatternIds?.Select(x => x.ToString(CultureInfo.InvariantCulture)).ToList(),
                 };
                 if (frameworkGuidanceGroup.BoundingPolygon != null && frameworkGuidanceGroup.BoundingPolygon.Polygons.Any())

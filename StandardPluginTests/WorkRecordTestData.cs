@@ -15,6 +15,76 @@ namespace StandardPluginTests
 {
     internal static class WorkRecordTestData
     {
+        internal static ApplicationDataModel CreateTimedField(params (OperationTypeEnum Type, DateTime Start, DateTime End, string Name)[] operations)
+        {
+            var model = CreateStraightPassApplicationDataModel(recordCount: 2);
+            foreach (var operation in operations)
+            {
+                AddTimedOperation(model, operation.Type, operation.Start, operation.End, operation.Name);
+            }
+
+            ((List<LoggedData>)model.Documents.LoggedData).RemoveAt(0);
+            return model;
+        }
+
+        internal static LoggedData AddTimedOperation(ApplicationDataModel model, OperationTypeEnum operationType, DateTime start, DateTime end, string description)
+        {
+            var loggedDatas = (List<LoggedData>)model.Documents.LoggedData;
+            var template = ((List<OperationData>)loggedDatas[0].OperationData)[0];
+            var appRateWorkingData = template.GetDeviceElementUses(2).First().GetWorkingDatas().OfType<NumericWorkingData>().First();
+            var records = CreateStraightPassRecords(2, appRateWorkingData, start: start);
+            var loggedData = new LoggedData
+            {
+                Description = description,
+                FieldId = loggedDatas[0].FieldId,
+                OperationData = new List<OperationData>
+                {
+                    new OperationData
+                    {
+                        Description = description,
+                        OperationType = operationType,
+                        ProductIds = template.ProductIds.ToList(),
+                        MaxDepth = template.MaxDepth,
+                        GetSpatialRecords = () => records,
+                        GetDeviceElementUses = template.GetDeviceElementUses
+                    }
+                },
+                TimeScopes = new List<TimeScope>
+                {
+                    new TimeScope
+                    {
+                        DateContext = DateContextEnum.ActualStart,
+                        TimeStamp1 = start,
+                        TimeStamp2 = end
+                    }
+                }
+            };
+            loggedDatas.Add(loggedData);
+            return loggedData;
+        }
+
+        internal static void AssignCropZone(ApplicationDataModel model, LoggedData loggedData, int cropId)
+        {
+            var zone = new CropZone
+            {
+                FieldId = loggedData.FieldId ?? 0,
+                CropId = cropId
+            };
+            model.Catalog.CropZones.Add(zone);
+            loggedData.CropZoneId = zone.Id.ReferenceId;
+        }
+
+        internal static void AssignVarietyCrop(ApplicationDataModel model, LoggedData loggedData, int cropId)
+        {
+            var variety = new CropVarietyProduct
+            {
+                Description = "Variety " + cropId.ToString(),
+                CropId = cropId
+            };
+            model.Catalog.Products.Add(variety);
+            ((List<OperationData>)loggedData.OperationData)[0].ProductIds = new List<int> { variety.Id.ReferenceId };
+        }
+
         internal static ApplicationDataModel CreateStraightPassApplicationDataModel(int recordCount = 25)
         {
             return CreateMultiSectionApplicationDataModel(sectionCount: 1, recordCount: recordCount);

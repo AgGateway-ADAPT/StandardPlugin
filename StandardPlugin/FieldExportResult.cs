@@ -11,7 +11,7 @@ namespace AgGateway.ADAPT.StandardPlugin
     internal sealed class FieldExportResult
     {
         internal int FieldIndex { get; set; }
-        internal WorkRecordElement WorkRecord { get; set; }
+        internal List<WorkRecordElement> WorkRecords { get; set; } = new List<WorkRecordElement>();
         internal List<IError> Errors { get; set; } = new List<IError>();
         internal List<LoggedData> LoggedDataToRelease { get; set; } = new List<LoggedData>();
     }
