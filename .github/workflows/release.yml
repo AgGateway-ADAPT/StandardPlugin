@@ -8,6 +8,9 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # lets the job request a GitHub OIDC token for nuget.org Trusted Publishing
 
     steps:
       - name: Check out repo
@@ -31,5 +34,11 @@ jobs:
       - name: Pack
         run: dotnet pack StandardPlugin/StandardPlugin.csproj --configuration Release --no-build -o output /p:PackageVersion=${{ steps.get_version.outputs.VERSION }}
 
+      - name: NuGet login (Trusted Publishing)
+        id: nuget_login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
       - name: Push to NuGet
-        run: dotnet nuget push "output/*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+        run: dotnet nuget push "output/*.nupkg" --api-key "${{ steps.nuget_login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
