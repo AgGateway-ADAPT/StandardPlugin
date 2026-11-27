@@ -7,6 +7,7 @@ using System.Threading;
 using AgGateway.ADAPT.ApplicationDataModel.ADM;
 using AgGateway.ADAPT.ApplicationDataModel.Common;
 using AgGateway.ADAPT.ApplicationDataModel.Documents;
+using AgGateway.ADAPT.ApplicationDataModel.Guidance;
 using AgGateway.ADAPT.ApplicationDataModel.LoggedData;
 using AgGateway.ADAPT.ApplicationDataModel.Representations;
 using AgGateway.ADAPT.StandardPlugin;
@@ -183,6 +184,80 @@ namespace StandardPluginTests
 
             Directory.CreateDirectory(folder);
             return folder;
+        }
+
+        [Test]
+        public void CatalogOnlyExportOmitsDocuments()
+        {
+            var adm = new ApplicationDataModel
+            {
+                Catalog = new Catalog(),
+                Documents = new Documents()
+            };
+            var folder = CreateCleanFolder("catalog-only");
+            new Plugin().Export(adm, folder);
+
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                Assert.That(document.RootElement.TryGetProperty("documents", out _), Is.False);
+                Assert.That(document.RootElement.TryGetProperty("catalog", out _), Is.True);
+            }
+        }
+
+        [Test]
+        public void GuidanceWithoutANameUsesAFixedLabel()
+        {
+            var adm = new ApplicationDataModel
+            {
+                Catalog = new Catalog
+                {
+                    GuidanceGroups = new List<GuidanceGroup>
+                    {
+                        new GuidanceGroup { Description = "Headland", GuidancePatternIds = new List<int> { 1 } },
+                        new GuidanceGroup { GuidancePatternIds = new List<int> { 2 } }
+                    },
+                    GuidancePatterns = new List<GuidancePattern>
+                    {
+                        new AbLine { Description = "AB0" },
+                        new AbLine()
+                    }
+                },
+                Documents = new Documents()
+            };
+            var folder = CreateCleanFolder("guidance-group-name");
+            new Plugin().Export(adm, folder);
+
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                var catalog = document.RootElement.GetProperty("catalog");
+                var groups = catalog.GetProperty("guidanceGroups");
+                Assert.That(groups[0].GetProperty("name").GetString(), Is.EqualTo("Headland"));
+                Assert.That(groups[1].GetProperty("name").GetString(), Is.EqualTo("Unnamed Guidance Group"));
+                var patterns = catalog.GetProperty("guidancePatterns");
+                Assert.That(patterns[0].GetProperty("name").GetString(), Is.EqualTo("AB0"));
+                Assert.That(patterns[1].GetProperty("name").GetString(), Is.EqualTo("Unnamed Guidance Pattern"));
+            }
+        }
+
+        [Test]
+        public void WorkRecordWithNoWrittenOperationsIsOmitted()
+        {
+            var adm = WorkRecordTestData.CreateStraightPassApplicationDataModel(recordCount: 2);
+            var operation = ((List<OperationData>)((List<LoggedData>)adm.Documents.LoggedData)[0].OperationData)[0];
+            foreach (var record in operation.GetSpatialRecords())
+            {
+                record.Geometry = null;
+            }
+
+            var folder = CreateCleanFolder("workrecord-no-operations");
+            ExportModel(adm, folder);
+
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                Assert.That(document.RootElement.TryGetProperty("documents", out _), Is.False);
+            }
+
+            Assert.That(Directory.GetFiles(folder, "*.parquet"), Is.Empty);
         }
 
         [Test]
@@ -600,6 +675,239 @@ namespace StandardPluginTests
             }
         }
 
+        [Test]
+        public void PlantingAndFertilizingWithin36HoursShareAWorkRecord()
+        {
+            var start = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.SowingAndPlanting, start, start.AddHours(4), "Plant"),
+                (OperationTypeEnum.Fertilizing, start.AddHours(1), start.AddHours(5), "Fertilize"));
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-plant-fert");
+
+            Assert.That(records, Has.Count.EqualTo(1));
+            Assert.That(records[0], Is.EquivalentTo(new[]
+            {
+                "APPLICATION_SOWING_AND_PLANTING_SEEDS",
+                "APPLICATION_FERTILIZING"
+            }));
+        }
+
+        [Test]
+        public void HarvestAndTillageWithin36HoursStaySeparate()
+        {
+            var start = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.Harvesting, start, start.AddHours(4), "Harvest"),
+                (OperationTypeEnum.Tillage, start.AddHours(2), start.AddHours(6), "Till"));
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-harvest-till");
+
+            Assert.That(records, Has.Count.EqualTo(2));
+            Assert.That(records.SelectMany(record => record), Is.EquivalentTo(new[]
+            {
+                "HARVEST",
+                "FIELD_PREPARATION_TILLAGE"
+            }));
+        }
+
+        [Test]
+        public void ApplicationSplitsWhenTheGapReaches36Hours()
+        {
+            var start = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var end = start.AddHours(4);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.Fertilizing, start, end, "First"),
+                (OperationTypeEnum.Fertilizing, end.AddHours(36), end.AddHours(40), "Second"));
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-gap-36");
+
+            Assert.That(records, Has.Count.EqualTo(2));
+            Assert.That(records.Select(record => record.Single()), Is.All.EqualTo("APPLICATION_FERTILIZING"));
+        }
+
+        [Test]
+        public void HarvestChainsAcrossDaysInside36Hours()
+        {
+            var first = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var second = new DateTime(2024, 6, 2, 8, 0, 0, DateTimeKind.Utc);
+            var third = new DateTime(2024, 6, 3, 8, 0, 0, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.Harvesting, first, first.AddHours(10), "Day1"),
+                (OperationTypeEnum.Harvesting, second, second.AddHours(10), "Day2"),
+                (OperationTypeEnum.Harvesting, third, third.AddHours(4), "Day3"));
+
+            var folder = CreateCleanFolder("workrecord-harvest-chain");
+            ExportModel(model, folder);
+            var records = ReadWorkRecordOperationTypes(folder);
+            var name = ReadWorkRecordNames(folder).Single();
+
+            Assert.That(records, Has.Count.EqualTo(1));
+            Assert.That(name, Does.Contain("Day1").And.Contain("Day2").And.Contain("Day3"));
+        }
+
+        [Test]
+        public void MixedLoggedDataSplitsHarvestFromPlanting()
+        {
+            var start = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.Harvesting, start, start.AddHours(4), "Mixed"),
+                (OperationTypeEnum.SowingAndPlanting, start, start.AddHours(4), "PlantOnSameData"));
+            var loggedDatas = (List<LoggedData>)model.Documents.LoggedData;
+            var operations = loggedDatas.SelectMany(loggedData => loggedData.OperationData).ToList();
+            loggedDatas[0].OperationData = operations;
+            loggedDatas.RemoveAt(1);
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-mixed-logged-data");
+
+            Assert.That(records, Has.Count.EqualTo(2));
+            Assert.That(records.SelectMany(record => record), Is.EquivalentTo(new[]
+            {
+                "HARVEST",
+                "APPLICATION_SOWING_AND_PLANTING_SEEDS"
+            }));
+        }
+
+        [Test]
+        public void DifferentCropZonesStayOnSeparateWorkRecords()
+        {
+            var start = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.SowingAndPlanting, start, start.AddHours(4), "Soy"),
+                (OperationTypeEnum.Fertilizing, start, start.AddHours(4), "Corn"));
+            var loggedDatas = (List<LoggedData>)model.Documents.LoggedData;
+            WorkRecordTestData.AssignCropZone(model, loggedDatas[0], cropId: 11);
+            WorkRecordTestData.AssignCropZone(model, loggedDatas[1], cropId: 22);
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-crop-zones");
+
+            Assert.That(records, Has.Count.EqualTo(2));
+        }
+
+        [Test]
+        public void DifferentProductCropsStayOnSeparateWorkRecords()
+        {
+            var start = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.SowingAndPlanting, start, start.AddHours(4), "SoySeed"),
+                (OperationTypeEnum.SowingAndPlanting, start, start.AddHours(4), "CornSeed"));
+            var loggedDatas = (List<LoggedData>)model.Documents.LoggedData;
+            WorkRecordTestData.AssignVarietyCrop(model, loggedDatas[0], cropId: 11);
+            WorkRecordTestData.AssignVarietyCrop(model, loggedDatas[1], cropId: 22);
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-product-crops");
+
+            Assert.That(records, Has.Count.EqualTo(2));
+        }
+
+        [Test]
+        public void SpatialFirstPointsWithin36HoursShareAWorkRecord()
+        {
+            var first = new DateTime(2015, 5, 2, 21, 23, 10, DateTimeKind.Utc);
+            var second = new DateTime(2015, 5, 2, 22, 21, 41, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.SowingAndPlanting, first, first.AddHours(1), "FirstVariety"),
+                (OperationTypeEnum.SowingAndPlanting, second, second.AddHours(2), "SecondVariety"));
+            foreach (var loggedData in (List<LoggedData>)model.Documents.LoggedData)
+            {
+                loggedData.TimeScopes.Clear();
+            }
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-spatial-near");
+
+            Assert.That(records, Has.Count.EqualTo(1));
+        }
+
+        [Test]
+        public void SpatialFirstPointsBeyond36HoursStaySeparate()
+        {
+            var first = new DateTime(2015, 5, 2, 21, 0, 0, DateTimeKind.Utc);
+            var second = first.AddHours(40);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.SowingAndPlanting, first, first.AddHours(1), "Early"),
+                (OperationTypeEnum.SowingAndPlanting, second, second.AddHours(1), "Late"));
+            foreach (var loggedData in (List<LoggedData>)model.Documents.LoggedData)
+            {
+                loggedData.TimeScopes.Clear();
+            }
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-spatial-far");
+
+            Assert.That(records, Has.Count.EqualTo(2));
+        }
+
+        [Test]
+        public void FertilizerWithoutACropJoinsOneNearbyPlanting()
+        {
+            var start = new DateTime(2024, 6, 1, 8, 0, 0, DateTimeKind.Utc);
+            var model = WorkRecordTestData.CreateTimedField(
+                (OperationTypeEnum.SowingAndPlanting, start, start.AddHours(4), "SoyPlant"),
+                (OperationTypeEnum.Fertilizing, start.AddHours(1), start.AddHours(5), "Fertilizer"));
+            WorkRecordTestData.AssignVarietyCrop(model, ((List<LoggedData>)model.Documents.LoggedData)[0], cropId: 11);
+
+            var records = ExportWorkRecordOperationTypes(model, "workrecord-fert-joins-plant");
+
+            Assert.That(records, Has.Count.EqualTo(1));
+            Assert.That(records[0], Is.EquivalentTo(new[]
+            {
+                "APPLICATION_SOWING_AND_PLANTING_SEEDS",
+                "APPLICATION_FERTILIZING"
+            }));
+        }
+
+        private static List<List<string>> ExportWorkRecordOperationTypes(ApplicationDataModel adm, string folderName)
+        {
+            var folder = CreateCleanFolder(folderName);
+            ExportModel(adm, folder);
+            return ReadWorkRecordOperationTypes(folder);
+        }
+
+        private static void ExportModel(ApplicationDataModel adm, string folder)
+        {
+            var properties = new Properties();
+            properties.SetProperty("SourceGeometryPosition", SourceGeometryPosition.ImplementReferencePoint.ToString());
+            properties.SetProperty("SourceDeviceDefinition", SourceDeviceDefinition.Machine0Implement1Section2.ToString());
+            properties.SetProperty("ParallelThreadCount", "1");
+            new Plugin().Export(adm, folder, properties);
+        }
+
+        private static List<List<string>> ReadWorkRecordOperationTypes(string folder)
+        {
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                var records = document.RootElement.GetProperty("documents").GetProperty("workRecords");
+                var results = new List<List<string>>();
+                foreach (var record in records.EnumerateArray())
+                {
+                    var types = new List<string>();
+                    foreach (var operation in record.GetProperty("operations").EnumerateArray())
+                    {
+                        types.Add(operation.GetProperty("operationTypeCode").GetString());
+                    }
+
+                    results.Add(types);
+                }
+
+                return results;
+            }
+        }
+
+        private static List<string> ReadWorkRecordNames(string folder)
+        {
+            using (var document = JsonDocument.Parse(ReadAdaptJson(folder)))
+            {
+                return document.RootElement.GetProperty("documents").GetProperty("workRecords")
+                    .EnumerateArray()
+                    .Select(record => record.GetProperty("name").GetString())
+                    .ToList();
+            }
+        }
+
+        private static string ReadAdaptJson(string folder)
+        {
+            return File.ReadAllText(Path.Combine(folder, "adapt.json")).TrimStart('\uFEFF');
+        }
+
         private static List<(string ReferenceId, string SpatialFile)> ReadWorkRecordOperations(string folder)
         {
             var json = File.ReadAllText(Path.Combine(folder, "adapt.json")).TrimStart('\uFEFF');
@@ -652,6 +960,39 @@ namespace StandardPluginTests
             {
                 File.Delete(path);
             }
+        }
+    }
+
+    public class SeasonExportTests
+    {
+        [Test]
+        public void SeasonWithoutANameUsesTheYear()
+        {
+            var exporters = new CommonExporters(new AgGateway.ADAPT.Standard.Root { Catalog = new AgGateway.ADAPT.Standard.Catalog() });
+            var season = exporters.GetOrAddSeason(new TimeScope
+            {
+                DateContext = DateContextEnum.CropSeason,
+                Description = "Spring planting",
+                TimeStamp1 = new DateTime(2022, 9, 1, 0, 0, 0, DateTimeKind.Utc),
+                TimeStamp2 = new DateTime(2023, 11, 1, 0, 0, 0, DateTimeKind.Utc)
+            });
+
+            Assert.That(season.Name, Is.EqualTo("2022"));
+            Assert.That(season.Description, Is.EqualTo("Spring planting"));
+        }
+
+        [Test]
+        public void SeasonWithoutADescriptionUsesTheYearForNameAndDescription()
+        {
+            var exporters = new CommonExporters(new AgGateway.ADAPT.Standard.Root { Catalog = new AgGateway.ADAPT.Standard.Catalog() });
+            var season = exporters.GetOrAddSeason(new TimeScope
+            {
+                DateContext = DateContextEnum.CropSeason,
+                TimeStamp2 = new DateTime(2015, 5, 2, 0, 0, 0, DateTimeKind.Utc)
+            });
+
+            Assert.That(season.Name, Is.EqualTo("2015"));
+            Assert.That(season.Description, Is.EqualTo("2015"));
         }
     }
 }
